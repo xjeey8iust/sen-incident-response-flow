@@ -1,12 +1,12 @@
-// Command feature-flag-service serves the HTTP API described in README.md.
+// Command sen-incident-response-flow serves the HTTP API described in README.md.
 package main
 
 import (
 	"log"
 	"os"
 
-	"github.com/luwa07832/feature-flag-service/internal/api"
-	"github.com/luwa07832/feature-flag-service/internal/store"
+	"github.com/xjeey8iust/sen-incident-response-flow/internal/api"
+	"github.com/xjeey8iust/sen-incident-response-flow/internal/store"
 )
 
 func main() {
@@ -16,7 +16,7 @@ func main() {
 	}
 	databasePath := os.Getenv("DB_PATH")
 	if databasePath == "" {
-		databasePath = "feature-flag-service.db"
+		databasePath = "sen-incident-response-flow.db"
 	}
 
 	st, err := store.Open(databasePath)
