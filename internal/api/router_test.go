@@ -412,6 +412,241 @@ func TestCreateConflictReturns409(t *testing.T) {
 	}
 }
 
+// replayFlow creates INC-1 with high, [db-1 web-2] and alice, then advances
+// it through every transition with the given owners, returning the body of
+// the final state. Tests use it to exercise create replay against an incident
+// whose current owner is no longer its registration owner.
+func replayFlow(t *testing.T, serverURL string, owners []string) map[string]any {
+	t.Helper()
+	if status, created := doRequest(t, http.MethodPost, serverURL+"/incidents", validBody); status != http.StatusCreated {
+		t.Fatalf("create status = %d (%v)", status, created)
+	}
+	stages := []string{"遏制", "清除", "恢复", "关闭"}
+	var moved map[string]any
+	for i, stage := range stages {
+		body := `{"stage":"` + stage + `","owner":"` + owners[i] + `"}`
+		status, incident := transition(t, serverURL, "INC-1", body)
+		if status != http.StatusOK {
+			t.Fatalf("transition to %s: status = %d (%v)", stage, status, incident)
+		}
+		moved = incident
+	}
+	return moved
+}
+
+func TestCreateReplayAfterTransitionReturnsCurrentRecord(t *testing.T) {
+	server, _ := newTestRouter(t)
+	moved := replayFlow(t, server.URL, []string{"bob", "carol", "dave", "erin"})
+	movedTimeline := moved["timeline"].([]any)
+	time.Sleep(time.Second) // a rewritten timestamp would be visible
+
+	// Re-sending the original create content (alice) returns 201 with the
+	// current record: stage stays at 关闭, owner stays erin, and the timeline
+	// keeps all five entries.
+	status, replayed := doRequest(t, http.MethodPost, server.URL+"/incidents", validBody)
+	if status != http.StatusCreated {
+		t.Fatalf("replay status = %d, want 201 (%v)", status, replayed)
+	}
+	if replayed["stage"] != "关闭" || replayed["owner"] != "erin" {
+		t.Fatalf("replay rolled back the incident: %v", replayed)
+	}
+	if replayed["severity"] != "high" || replayed["id"] != "INC-1" {
+		t.Fatalf("replay changed identity: %v", replayed)
+	}
+	assets := replayed["assets"].([]any)
+	if len(assets) != 2 || assets[0] != "db-1" || assets[1] != "web-2" {
+		t.Fatalf("replay changed assets: %v", replayed["assets"])
+	}
+	replayedTimeline := replayed["timeline"].([]any)
+	if len(replayedTimeline) != len(movedTimeline) {
+		t.Fatalf("replay changed timeline length: %v", replayedTimeline)
+	}
+	for i := range movedTimeline {
+		want := movedTimeline[i].(map[string]any)
+		got := replayedTimeline[i].(map[string]any)
+		if got["stage"] != want["stage"] || got["owner"] != want["owner"] || got["at"] != want["at"] {
+			t.Fatalf("replay changed timeline entry %d: %v vs %v", i, got, want)
+		}
+	}
+
+	// A subsequent GET returns the same record.
+	status, fetched := doRequest(t, http.MethodGet, server.URL+"/incidents?id=INC-1", "")
+	if status != http.StatusOK {
+		t.Fatalf("fetch status = %d", status)
+	}
+	fetchedTimeline := fetched["timeline"].([]any)
+	if fetched["stage"] != "关闭" || fetched["owner"] != "erin" || len(fetchedTimeline) != len(movedTimeline) {
+		t.Fatalf("fetch after replay = %v", fetched)
+	}
+	for i := range movedTimeline {
+		want := movedTimeline[i].(map[string]any)
+		got := fetchedTimeline[i].(map[string]any)
+		if got["at"] != want["at"] || got["stage"] != want["stage"] || got["owner"] != want["owner"] {
+			t.Fatalf("fetch changed timeline entry %d: %v vs %v", i, got, want)
+		}
+	}
+}
+
+func TestCreateReplayOwnerComparedWithRegistrationOwner(t *testing.T) {
+	server, _ := newTestRouter(t)
+	// The example from the contract: created by alice, transitioned to
+	// 遏制 with bob.
+	if status, _ := doRequest(t, http.MethodPost, server.URL+"/incidents", validBody); status != http.StatusCreated {
+		t.Fatalf("create status = %d", status)
+	}
+	if status, _ := transition(t, server.URL, "INC-1", `{"stage":"遏制","owner":"bob"}`); status != http.StatusOK {
+		t.Fatalf("transition status = %d", status)
+	}
+
+	// Replaying the original content still returns 201 with owner bob.
+	status, body := doRequest(t, http.MethodPost, server.URL+"/incidents", validBody)
+	if status != http.StatusCreated {
+		t.Fatalf("replay status = %d, want 201 (%v)", status, body)
+	}
+	if body["stage"] != "遏制" || body["owner"] != "bob" {
+		t.Fatalf("replay body = %v", body)
+	}
+	if timeline := body["timeline"].([]any); len(timeline) != 2 {
+		t.Fatalf("replay timeline = %v, want both entries", timeline)
+	}
+
+	// Sending the current owner (bob) as the create owner is not a replay.
+	currentOwner := `{"id":"INC-1","severity":"high","assets":["db-1","web-2"],"owner":"bob"}`
+	status, conflict := doRequest(t, http.MethodPost, server.URL+"/incidents", currentOwner)
+	if status != http.StatusConflict {
+		t.Fatalf("current-owner replay status = %d, want 409 (%v)", status, conflict)
+	}
+	if code := errorCode(t, conflict); code != "incident_conflict" {
+		t.Fatalf("code = %q, want incident_conflict", code)
+	}
+	if len(conflict) != 1 {
+		t.Fatalf("error response must hold only the top-level error object: %v", conflict)
+	}
+}
+
+func TestCreateReplayConflictsOnAnyRegistrationValueChange(t *testing.T) {
+	server, _ := newTestRouter(t)
+	replayFlow(t, server.URL, []string{"bob", "carol", "dave", "erin"})
+
+	cases := map[string]string{
+		"severity differs":        `{"id":"INC-1","severity":"low","assets":["db-1","web-2"],"owner":"alice"}`,
+		"asset content differs":   `{"id":"INC-1","severity":"high","assets":["db-1","web-3"],"owner":"alice"}`,
+		"asset added":             `{"id":"INC-1","severity":"high","assets":["db-1","web-2","db-2"],"owner":"alice"}`,
+		"asset removed":           `{"id":"INC-1","severity":"high","assets":["db-1"],"owner":"alice"}`,
+		"asset order differs":     `{"id":"INC-1","severity":"high","assets":["web-2","db-1"],"owner":"alice"}`,
+		"asset duplicates differ": `{"id":"INC-1","severity":"high","assets":["db-1","db-1","web-2"],"owner":"alice"}`,
+		// Whitespace and case are kept verbatim and compared verbatim.
+		"owner keeps whitespace": `{"id":"INC-1","severity":"high","assets":["db-1","web-2"],"owner":" alice "}`,
+		"owner keeps case":       `{"id":"INC-1","severity":"high","assets":["db-1","web-2"],"owner":"Alice"}`,
+		"asset keeps whitespace": `{"id":"INC-1","severity":"high","assets":["db-1"," web-2"],"owner":"alice"}`,
+		"asset keeps case":       `{"id":"INC-1","severity":"high","assets":["DB-1","web-2"],"owner":"alice"}`,
+		"owner is current owner": `{"id":"INC-1","severity":"high","assets":["db-1","web-2"],"owner":"erin"}`,
+		"owner is middle owner":  `{"id":"INC-1","severity":"high","assets":["db-1","web-2"],"owner":"carol"}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			status, decoded := doRequest(t, http.MethodPost, server.URL+"/incidents", body)
+			if status != http.StatusConflict {
+				t.Fatalf("status = %d, want 409 (%v)", status, decoded)
+			}
+			if code := errorCode(t, decoded); code != "incident_conflict" {
+				t.Fatalf("code = %q, want incident_conflict", code)
+			}
+		})
+	}
+
+	// Neither the successful replays nor the conflicts wrote anything.
+	status, fetched := doRequest(t, http.MethodGet, server.URL+"/incidents?id=INC-1", "")
+	if status != http.StatusOK {
+		t.Fatalf("fetch status = %d", status)
+	}
+	if fetched["stage"] != "关闭" || fetched["owner"] != "erin" {
+		t.Fatalf("record changed: %v", fetched)
+	}
+	if timeline := fetched["timeline"].([]any); len(timeline) != 5 {
+		t.Fatalf("record changed timeline: %v", timeline)
+	}
+}
+
+func TestCreateReplayStillValidatesStrictly(t *testing.T) {
+	server, _ := newTestRouter(t)
+	replayFlow(t, server.URL, []string{"bob", "carol", "dave", "erin"})
+
+	// Validation still precedes the conflict/replay check even for an
+	// existing id that has moved through the whole flow.
+	cases := map[string]string{
+		"not json":         `nope`,
+		"json array":       `[]`,
+		"unknown field":    `{"id":"INC-1","severity":"high","assets":["a"],"owner":"alice","extra":1}`,
+		"duplicate id":     `{"id":"INC-1","id":"INC-1","severity":"high","assets":["a"],"owner":"alice"}`,
+		"missing owner":    `{"id":"INC-1","severity":"high","assets":["db-1","web-2"]}`,
+		"null severity":    `{"id":"INC-1","severity":null,"assets":["db-1","web-2"],"owner":"alice"}`,
+		"unknown enum":     `{"id":"INC-1","severity":"urgent","assets":["db-1","web-2"],"owner":"alice"}`,
+		"assets empty":     `{"id":"INC-1","severity":"high","assets":[],"owner":"alice"}`,
+		"owner blank":      `{"id":"INC-1","severity":"high","assets":["db-1","web-2"],"owner":" "}`,
+		"owner wrong type": `{"id":"INC-1","severity":"high","assets":["db-1","web-2"],"owner":7}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			status, decoded := doRequest(t, http.MethodPost, server.URL+"/incidents", body)
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (%v)", status, decoded)
+			}
+			if code := errorCode(t, decoded); code != "invalid_request" {
+				t.Fatalf("code = %q, want invalid_request", code)
+			}
+		})
+	}
+}
+
+func TestCreateReplaySurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "service.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	first := httptest.NewServer(NewRouter(st))
+	if status, _ := doRequest(t, http.MethodPost, first.URL+"/incidents", validBody); status != http.StatusCreated {
+		t.Fatalf("create status = %d", status)
+	}
+	if status, moved := transition(t, first.URL, "INC-1", `{"stage":"遏制","owner":"bob"}`); status != http.StatusOK {
+		t.Fatalf("transition status = %d (%v)", status, moved)
+	}
+	first.Close()
+	st.Close()
+
+	// A restarted service reads existing records without re-registration:
+	// replay succeeds against the persisted registration owner, and the
+	// current owner still conflicts.
+	reopened, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	second := httptest.NewServer(NewRouter(reopened))
+	defer second.Close()
+
+	status, replayed := doRequest(t, http.MethodPost, second.URL+"/incidents", validBody)
+	if status != http.StatusCreated {
+		t.Fatalf("replay after restart status = %d (%v)", status, replayed)
+	}
+	if replayed["stage"] != "遏制" || replayed["owner"] != "bob" {
+		t.Fatalf("replay after restart = %v", replayed)
+	}
+	if timeline := replayed["timeline"].([]any); len(timeline) != 2 {
+		t.Fatalf("replay after restart timeline = %v", timeline)
+	}
+
+	currentOwner := `{"id":"INC-1","severity":"high","assets":["db-1","web-2"],"owner":"bob"}`
+	status, body := doRequest(t, http.MethodPost, second.URL+"/incidents", currentOwner)
+	if status != http.StatusConflict {
+		t.Fatalf("current-owner replay after restart status = %d (%v)", status, body)
+	}
+	if code := errorCode(t, body); code != "incident_conflict" {
+		t.Fatalf("code = %q, want incident_conflict", code)
+	}
+}
+
 func TestCreateValidatesBeforeConflictCheck(t *testing.T) {
 	server, _ := newTestRouter(t)
 	if status, _ := doRequest(t, http.MethodPost, server.URL+"/incidents", validBody); status != http.StatusCreated {

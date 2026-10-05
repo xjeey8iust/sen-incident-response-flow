@@ -55,7 +55,7 @@ go run .
 {"id":"INC-1","severity":"high","assets":["db-1","web-2"],"stage":"受理","owner":"alice","timeline":[{"stage":"受理","owner":"alice","at":"2026-10-05T03:45:18Z"}]}
 ```
 
-同一 `id` 重复登记时按值识别：`severity`、`assets`（含顺序）、`owner` 完全相同则返回 201 与原记录，不修改时间也不追加历史；任一值不同返回 409：
+同一 `id` 重复登记时始终按**首次成功创建**的内容识别：`severity`、`assets`（含顺序与重复项）、`owner` 与首次创建逐值相同则返回 201 与当前保存的完整工单（`stage`、当前 `owner`、`timeline` 反映已完成的流转，不回退到受理），不修改时间也不追加历史。比较的 `owner` 是首次创建的责任人，而非流转后的当前责任人；任一值不同返回 409：
 
 ```json
 {"error":{"code":"incident_conflict","message":"incident id is already registered with different attributes"}}
