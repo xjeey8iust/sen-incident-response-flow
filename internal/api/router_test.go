@@ -1036,3 +1036,174 @@ func TestTransitionPersistsAcrossRestart(t *testing.T) {
 		t.Fatalf("timeline after restart = %v", body["timeline"])
 	}
 }
+
+// checkBodyConsistent fails the test unless a decoded incident body is
+// internally consistent: stage and owner match the last timeline entry and
+// the timeline walks the stage flow one entry at a time with the owners the
+// flow assigned. A body assembled from two committed states violates this.
+func checkBodyConsistent(t *testing.T, body map[string]any, stages, owners []string) {
+	t.Helper()
+	timeline, ok := body["timeline"].([]any)
+	if !ok || len(timeline) == 0 {
+		t.Fatalf("body has no timeline: %v", body)
+	}
+	idx := -1
+	for i, stage := range stages {
+		if body["stage"] == stage {
+			idx = i
+		}
+	}
+	if idx < 0 {
+		t.Fatalf("stage = %v, not on the flow", body["stage"])
+	}
+	if len(timeline) != idx+1 {
+		t.Fatalf("stage %v with %d timeline entries, want %d: %v",
+			body["stage"], len(timeline), idx+1, body)
+	}
+	if body["owner"] != owners[idx] {
+		t.Fatalf("stage %v with owner %v, want %q: %v", body["stage"], body["owner"], owners[idx], body)
+	}
+	for i, item := range timeline {
+		entry := item.(map[string]any)
+		if entry["stage"] != stages[i] || entry["owner"] != owners[i] {
+			t.Fatalf("timeline entry %d = %v, want %q/%q: %v", i, entry, stages[i], owners[i], body)
+		}
+		if entry["at"] == "" {
+			t.Fatalf("timeline entry %d lost its timestamp: %v", i, body)
+		}
+	}
+	last := timeline[len(timeline)-1].(map[string]any)
+	if last["stage"] != body["stage"] || last["owner"] != body["owner"] {
+		t.Fatalf("body %v/%v disagrees with last entry %v", body["stage"], body["owner"], last)
+	}
+}
+
+func TestQueryConsistentWhileTransitionsCommit(t *testing.T) {
+	server, _ := newTestRouter(t)
+	stages := []string{"受理", "遏制", "清除", "恢复", "关闭"}
+	owners := []string{"alice", "bob", "carol", "dave", "erin"}
+
+	registerIncident(t, server.URL, "INC-1", "high", owners[0])
+	registerIncident(t, server.URL, "INC-2", "high", owners[0])
+	registerIncident(t, server.URL, "INC-3", "low", owners[0])
+
+	// Concurrent readers query by id, by stage, and by the severity/stage
+	// combination while the writer walks INC-1 and INC-2 through the flow.
+	// Every 200 response must reflect one committed state: for INC-1 and
+	// INC-2 either the pre-transition body with its shorter history or the
+	// post-transition one, never a mixture.
+	byID := map[string]bool{
+		"/incidents?id=INC-1": true,
+		"/incidents?id=INC-2": true,
+	}
+	stageAccepted := "/incidents?stage=" + url.QueryEscape("受理")
+	combo := "/incidents?severity=high&stage=" + url.QueryEscape("遏制")
+	queries := []string{
+		"/incidents?id=INC-1",
+		"/incidents?id=INC-2",
+		"/incidents",
+		stageAccepted,
+		combo,
+	}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				for _, path := range queries {
+					response, err := http.Get(server.URL + path)
+					if err != nil {
+						t.Errorf("get %s: %v", path, err)
+						return
+					}
+					if response.StatusCode != http.StatusOK {
+						response.Body.Close()
+						t.Errorf("get %s: status %d", path, response.StatusCode)
+						return
+					}
+					if byID[path] {
+						var body map[string]any
+						if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+							t.Errorf("decode %s: %v", path, err)
+							response.Body.Close()
+							return
+						}
+						checkBodyConsistent(t, body, stages, owners)
+					} else {
+						var items []any
+						if err := json.NewDecoder(response.Body).Decode(&items); err != nil {
+							t.Errorf("decode %s: %v", path, err)
+							response.Body.Close()
+							return
+						}
+						for _, item := range items {
+							body := item.(map[string]any)
+							checkBodyConsistent(t, body, stages, owners)
+							// Filter membership is decided in the same state
+							// the body came from, and combined filters
+							// intersect.
+							if path == stageAccepted && body["stage"] != "受理" {
+								t.Errorf("受理 filter returned %v", body)
+							}
+							if path == combo && (body["severity"] != "high" || body["stage"] != "遏制") {
+								t.Errorf("combined filter returned %v", body)
+							}
+						}
+					}
+					response.Body.Close()
+				}
+			}
+		}()
+	}
+
+	timestamps := map[string][]string{}
+	for _, id := range []string{"INC-1", "INC-2"} {
+		_, created := doRequest(t, http.MethodGet, server.URL+"/incidents?id="+id, "")
+		timestamps[id] = []string{created["timeline"].([]any)[0].(map[string]any)["at"].(string)}
+		for i := 1; i < len(stages); i++ {
+			body := `{"stage":"` + stages[i] + `","owner":"` + owners[i] + `"}`
+			status, moved := transition(t, server.URL, id, body)
+			if status != http.StatusOK {
+				t.Fatalf("transition %s to %s: status %d (%v)", id, stages[i], status, moved)
+			}
+			entry := moved["timeline"].([]any)[i].(map[string]any)
+			timestamps[id] = append(timestamps[id], entry["at"].(string))
+		}
+	}
+	close(stop)
+	wg.Wait()
+
+	// After every transition returned, queries show the final 关闭 state
+	// with the complete history and the original timestamps untouched.
+	for _, id := range []string{"INC-1", "INC-2"} {
+		status, fetched := doRequest(t, http.MethodGet, server.URL+"/incidents?id="+id, "")
+		if status != http.StatusOK {
+			t.Fatalf("fetch %s: status %d", id, status)
+		}
+		checkBodyConsistent(t, fetched, stages, owners)
+		timeline := fetched["timeline"].([]any)
+		for i, item := range timeline {
+			if at := item.(map[string]any)["at"]; at != timestamps[id][i] {
+				t.Fatalf("%s entry %d at = %v, want the original %v", id, i, at, timestamps[id][i])
+			}
+		}
+	}
+
+	// The combined filter intersects on the final state: both high
+	// incidents are closed, only INC-3 is still 受理.
+	_, items := listIncidents(t, server.URL+"/incidents?severity=high&stage="+url.QueryEscape("关闭"))
+	if len(items) != 2 || items[0].(map[string]any)["id"] != "INC-1" || items[1].(map[string]any)["id"] != "INC-2" {
+		t.Fatalf("final high/关闭 list = %v", items)
+	}
+	_, items = listIncidents(t, server.URL+"/incidents?stage="+url.QueryEscape("受理"))
+	if len(items) != 1 || items[0].(map[string]any)["id"] != "INC-3" {
+		t.Fatalf("final 受理 list = %v", items)
+	}
+}

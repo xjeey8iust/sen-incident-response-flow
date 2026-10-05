@@ -4,6 +4,7 @@ import (
 	"errors"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -439,4 +440,214 @@ func TestTransitionConcurrentSameStage(t *testing.T) {
 	if got.Stage != "遏制" || got.Owner != "racer" || len(got.Timeline) != 2 {
 		t.Fatalf("incident = %+v, want one transition and two entries", got)
 	}
+}
+
+// flowExpectation describes the committed states one incident walks through:
+// stageFlow[i] is reached from stageFlow[i-1] by a transition that appends a
+// timeline entry owned by ownerFlow[i].
+var (
+	stageFlow = []string{"受理", "遏制", "清除", "恢复", "关闭"}
+	ownerFlow = []string{"alice", "bob", "carol", "dave", "erin"}
+)
+
+// checkConsistent fails the test unless incident is internally consistent:
+// the body matches the last timeline entry, the timeline has exactly one
+// entry per stage up to the current one, and every entry carries the stage
+// and owner the flow assigned to it. A body read from one committed state
+// paired with a history read from another violates every one of these.
+func checkConsistent(t *testing.T, incident Incident) {
+	t.Helper()
+	idx := slices.Index(stageFlow, incident.Stage)
+	if idx < 0 {
+		t.Fatalf("stage = %q, not on the flow", incident.Stage)
+	}
+	if len(incident.Timeline) != idx+1 {
+		t.Fatalf("stage %q with %d timeline entries, want %d: %+v",
+			incident.Stage, len(incident.Timeline), idx+1, incident)
+	}
+	if incident.Owner != ownerFlow[idx] {
+		t.Fatalf("stage %q with owner %q, want %q: %+v",
+			incident.Stage, incident.Owner, ownerFlow[idx], incident)
+	}
+	for i, entry := range incident.Timeline {
+		if entry.Stage != stageFlow[i] || entry.Owner != ownerFlow[i] {
+			t.Fatalf("timeline entry %d = %+v, want %q/%q: %+v",
+				i, entry, stageFlow[i], ownerFlow[i], incident)
+		}
+		if entry.At == "" {
+			t.Fatalf("timeline entry %d lost its timestamp: %+v", i, incident)
+		}
+	}
+	last := incident.Timeline[len(incident.Timeline)-1]
+	if last.Stage != incident.Stage || last.Owner != incident.Owner {
+		t.Fatalf("body %q/%q disagrees with last entry %+v",
+			incident.Stage, incident.Owner, last)
+	}
+}
+
+func TestGetConsistentWhileTransitionsCommit(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+
+	if _, err := st.Register("INC-1", "high", ownerFlow[0], []string{"a"}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// Readers hammer Get while the writer walks the incident through every
+	// stage. Each read must land entirely before or entirely after a commit:
+	// either the 受理/alice body with one entry, a later stage with its full
+	// history, but never a mixture of two states.
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				incident, err := st.Get("INC-1")
+				if err != nil {
+					t.Errorf("get: %v", err)
+					return
+				}
+				checkConsistent(t, incident)
+			}
+		}()
+	}
+
+	timestamps := make([]string, 0, len(stageFlow))
+	first, err := st.Get("INC-1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	timestamps = append(timestamps, first.Timeline[0].At)
+	for i := 1; i < len(stageFlow); i++ {
+		moved, err := st.Transition("INC-1", stageFlow[i], ownerFlow[i])
+		if err != nil {
+			t.Fatalf("transition to %s: %v", stageFlow[i], err)
+		}
+		timestamps = append(timestamps, moved.Timeline[len(moved.Timeline)-1].At)
+	}
+	close(stop)
+	wg.Wait()
+
+	// After the last transition returned, the stored record is the complete
+	// 关闭 state with every original timestamp preserved.
+	got, err := st.Get("INC-1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	checkConsistent(t, got)
+	for i, entry := range got.Timeline {
+		if entry.At != timestamps[i] {
+			t.Fatalf("entry %d at = %q, want the original %q", i, entry.At, timestamps[i])
+		}
+	}
+}
+
+func TestListConsistentWhileTransitionsCommit(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+
+	// INC-1 and INC-2 share a severity and advance through the flow; INC-3
+	// stays in 受理 so the 受理 filter never goes empty.
+	for _, item := range []struct {
+		id       string
+		severity string
+	}{
+		{"INC-1", "high"},
+		{"INC-2", "high"},
+		{"INC-3", "low"},
+	} {
+		if _, err := st.Register(item.id, item.severity, ownerFlow[0], []string{"a"}); err != nil {
+			t.Fatalf("register %s: %v", item.id, err)
+		}
+	}
+
+	filters := []struct {
+		severity string
+		stage    string
+	}{
+		{"", ""},
+		{"high", ""},
+		{"", "受理"},
+		{"high", "受理"},
+		{"high", "遏制"},
+		{"low", "受理"},
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				for _, filter := range filters {
+					incidents, err := st.List(filter.severity, filter.stage)
+					if err != nil {
+						t.Errorf("list %q/%q: %v", filter.severity, filter.stage, err)
+						return
+					}
+					for _, incident := range incidents {
+						// Every member matches the filter in the state its
+						// own body and history came from, and the combination
+						// of filters is an intersection.
+						if filter.severity != "" && incident.Severity != filter.severity {
+							t.Errorf("severity filter %q returned %+v", filter.severity, incident)
+						}
+						if filter.stage != "" && incident.Stage != filter.stage {
+							t.Errorf("stage filter %q returned %+v", filter.stage, incident)
+						}
+						checkConsistent(t, incident)
+					}
+				}
+			}
+		}()
+	}
+
+	for _, id := range []string{"INC-1", "INC-2"} {
+		for i := 1; i < len(stageFlow); i++ {
+			if _, err := st.Transition(id, stageFlow[i], ownerFlow[i]); err != nil {
+				t.Fatalf("transition %s to %s: %v", id, stageFlow[i], err)
+			}
+		}
+	}
+	close(stop)
+	wg.Wait()
+
+	// With no writes in flight, each filter reflects the final state.
+	final, err := st.List("high", "关闭")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(final) != 2 || final[0].ID != "INC-1" || final[1].ID != "INC-2" {
+		t.Fatalf("final high/关闭 list = %+v", final)
+	}
+	for _, incident := range final {
+		checkConsistent(t, incident)
+	}
+	accepted, err := st.List("", "受理")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(accepted) != 1 || accepted[0].ID != "INC-3" {
+		t.Fatalf("final 受理 list = %+v", accepted)
+	}
+	checkConsistent(t, accepted[0])
 }

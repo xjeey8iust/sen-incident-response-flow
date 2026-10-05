@@ -229,6 +229,9 @@ func (s *Store) Get(id string) (Incident, error) {
 
 // List returns every incident matching the optional severity and stage
 // filters, ordered by id in UTF-8 byte order. Empty filters match everything.
+// The filter, the bodies, and every timeline are read inside one transaction,
+// so the whole result reflects a single committed state even when a
+// transition commits while the list is being assembled.
 func (s *Store) List(severity, stage string) ([]Incident, error) {
 	query := "SELECT id, severity, assets, stage, owner FROM incidents"
 	var clauses []string
@@ -246,7 +249,13 @@ func (s *Store) List(severity, stage string) ([]Incident, error) {
 	}
 	query += " ORDER BY id"
 
-	rows, err := s.db.Query(query, args...)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin list: %w", err)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list incidents: %w", err)
 	}
@@ -266,7 +275,7 @@ func (s *Store) List(severity, stage string) ([]Incident, error) {
 	rows.Close()
 
 	for i := range incidents {
-		timeline, err := s.timeline(incidents[i].ID)
+		timeline, err := queryTimeline(tx, incidents[i].ID)
 		if err != nil {
 			return nil, err
 		}
@@ -275,9 +284,18 @@ func (s *Store) List(severity, stage string) ([]Incident, error) {
 	return incidents, nil
 }
 
-// find loads one incident by id, returning nil when it does not exist.
+// find loads one incident by id, returning nil when it does not exist. The
+// body and its timeline are read inside one transaction so the result always
+// comes from a single committed state: a transition committing between the
+// two reads cannot pair a new history with the old stage and owner.
 func (s *Store) find(id string) (*Incident, error) {
-	row := s.db.QueryRow(
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin find: %w", err)
+	}
+	defer tx.Rollback()
+
+	row := tx.QueryRow(
 		"SELECT id, severity, assets, stage, owner FROM incidents WHERE id = ?", id)
 	incident, err := scanIncident(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -286,17 +304,12 @@ func (s *Store) find(id string) (*Incident, error) {
 	if err != nil {
 		return nil, err
 	}
-	timeline, err := s.timeline(id)
+	timeline, err := queryTimeline(tx, id)
 	if err != nil {
 		return nil, err
 	}
 	incident.Timeline = timeline
 	return &incident, nil
-}
-
-// timeline loads the transition history of one incident in entry order.
-func (s *Store) timeline(id string) ([]TimelineEntry, error) {
-	return queryTimeline(s.db, id)
 }
 
 // queryTimeline is timeline against any handle, so a transaction can read
