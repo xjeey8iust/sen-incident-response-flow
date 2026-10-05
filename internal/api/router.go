@@ -45,6 +45,7 @@ func NewRouter(st *store.Store) *gin.Engine {
 
 	router.POST("/incidents", createIncident(st))
 	router.GET("/incidents", queryIncidents(st))
+	router.POST("/incidents/:id/transition", transitionIncident(st))
 
 	router.NoRoute(func(c *gin.Context) {
 		writeError(c, http.StatusNotFound, "route_not_found", "no route matches this path")
@@ -100,47 +101,57 @@ func createIncident(st *store.Store) gin.HandlerFunc {
 // case variants like "ID" fall outside the whitelist.
 func decodeRegisterRequest(body io.Reader) (registerRequest, bool) {
 	var payload registerRequest
+	ok := decodeStrictObject(body, registerFields, func(key string, decoder *json.Decoder) error {
+		switch key {
+		case "id":
+			return decoder.Decode(&payload.ID)
+		case "severity":
+			return decoder.Decode(&payload.Severity)
+		case "assets":
+			return decoder.Decode(&payload.Assets)
+		case "owner":
+			return decoder.Decode(&payload.Owner)
+		}
+		return nil
+	})
+	return payload, ok
+}
+
+// decodeStrictObject parses body as a single JSON object whose keys all pass
+// the case-sensitive allowed whitelist and never repeat, binding each value
+// through bind. Anything else — trailing data, arrays, scalars, unknown or
+// duplicate keys, malformed values — is rejected.
+func decodeStrictObject(body io.Reader, allowed map[string]bool, bind func(key string, decoder *json.Decoder) error) bool {
 	decoder := json.NewDecoder(body)
 	token, err := decoder.Token()
 	if err != nil {
-		return payload, false
+		return false
 	}
 	if delim, ok := token.(json.Delim); !ok || delim != '{' {
-		return payload, false
+		return false
 	}
 	seen := map[string]bool{}
 	for decoder.More() {
 		token, err := decoder.Token()
 		if err != nil {
-			return payload, false
+			return false
 		}
 		key, ok := token.(string)
-		if !ok || !registerFields[key] || seen[key] {
-			return payload, false
+		if !ok || !allowed[key] || seen[key] {
+			return false
 		}
 		seen[key] = true
-		var decodeErr error
-		switch key {
-		case "id":
-			decodeErr = decoder.Decode(&payload.ID)
-		case "severity":
-			decodeErr = decoder.Decode(&payload.Severity)
-		case "assets":
-			decodeErr = decoder.Decode(&payload.Assets)
-		case "owner":
-			decodeErr = decoder.Decode(&payload.Owner)
-		}
-		if decodeErr != nil {
-			return payload, false
+		if err := bind(key, decoder); err != nil {
+			return false
 		}
 	}
 	if _, err := decoder.Token(); err != nil {
-		return payload, false
+		return false
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return payload, false
+		return false
 	}
-	return payload, true
+	return true
 }
 
 // valid reports whether every required field is present and well formed.
@@ -225,8 +236,80 @@ func queryIncidents(st *store.Store) gin.HandlerFunc {
 	}
 }
 
+// transitionRequest mirrors the accepted transition body. Pointer fields let
+// the handler reject missing keys and explicit nulls alike.
+type transitionRequest struct {
+	Stage *string `json:"stage"`
+	Owner *string `json:"owner"`
+}
+
+// transitionFields is the case-sensitive whitelist of accepted transition
+// fields, compared after JSON unescaping just like the registration fields.
+var transitionFields = map[string]bool{
+	"stage": true,
+	"owner": true,
+}
+
+func transitionIncident(st *store.Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		payload, ok := decodeTransitionRequest(c.Request.Body)
+		if !ok || !payload.valid() {
+			writeInvalidTransitionRequest(c)
+			return
+		}
+
+		incident, err := st.Transition(c.Param("id"), *payload.Stage, *payload.Owner)
+		if errors.Is(err, store.ErrIncidentNotFound) {
+			writeError(c, http.StatusNotFound, "incident_not_found", "no incident is registered with this id")
+			return
+		}
+		if errors.Is(err, store.ErrInvalidTransition) {
+			writeError(c, http.StatusConflict, "invalid_transition", "transition must advance exactly one stage")
+			return
+		}
+		if err != nil {
+			writeError(c, http.StatusServiceUnavailable, "storage_unavailable", "database is not available")
+			return
+		}
+		c.JSON(http.StatusOK, incident)
+	}
+}
+
+// decodeTransitionRequest parses the transition body with the same strict
+// rules as the registration body: a single JSON object, case-sensitive
+// whitelisted field names, no duplicates even after JSON unescaping.
+func decodeTransitionRequest(body io.Reader) (transitionRequest, bool) {
+	var payload transitionRequest
+	ok := decodeStrictObject(body, transitionFields, func(key string, decoder *json.Decoder) error {
+		switch key {
+		case "stage":
+			return decoder.Decode(&payload.Stage)
+		case "owner":
+			return decoder.Decode(&payload.Owner)
+		}
+		return nil
+	})
+	return payload, ok
+}
+
+// valid reports whether both required fields are present and well formed.
+// The owner string is kept as-is; only its non-blankness is checked.
+func (r *transitionRequest) valid() bool {
+	if r.Stage == nil || !validStages[*r.Stage] {
+		return false
+	}
+	if r.Owner == nil || strings.TrimSpace(*r.Owner) == "" {
+		return false
+	}
+	return true
+}
+
 func writeInvalidRequest(c *gin.Context) {
 	writeError(c, http.StatusBadRequest, "invalid_request", "request body must be a single JSON object with valid id, severity, assets, and owner")
+}
+
+func writeInvalidTransitionRequest(c *gin.Context) {
+	writeError(c, http.StatusBadRequest, "invalid_request", "request body must be a single JSON object with valid stage and owner")
 }
 
 func writeInvalidQuery(c *gin.Context) {

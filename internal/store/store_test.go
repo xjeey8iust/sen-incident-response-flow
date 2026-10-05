@@ -217,3 +217,243 @@ func TestListOrdersByIDBytesAndFilters(t *testing.T) {
 		t.Fatalf("expected empty result, got %+v", none)
 	}
 }
+
+func TestTransitionAdvancesOneStage(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+
+	registered, err := st.Register("INC-1", "high", "alice", []string{"db-1", "web-2"})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	incident, err := st.Transition("INC-1", "遏制", "bob")
+	if err != nil {
+		t.Fatalf("transition: %v", err)
+	}
+	if incident.Stage != "遏制" || incident.Owner != "bob" {
+		t.Fatalf("stage/owner = %q/%q, want 遏制/bob", incident.Stage, incident.Owner)
+	}
+	if incident.ID != registered.ID || incident.Severity != registered.Severity ||
+		!reflect.DeepEqual(incident.Assets, registered.Assets) {
+		t.Fatalf("transition changed fixed fields: %+v vs %+v", incident, registered)
+	}
+	if len(incident.Timeline) != 2 {
+		t.Fatalf("timeline length = %d, want 2", len(incident.Timeline))
+	}
+	if incident.Timeline[0] != registered.Timeline[0] {
+		t.Fatalf("transition rewrote history: %+v vs %+v", incident.Timeline[0], registered.Timeline[0])
+	}
+	entry := incident.Timeline[1]
+	if entry.Stage != "遏制" || entry.Owner != "bob" {
+		t.Fatalf("new entry = %+v, want 遏制/bob", entry)
+	}
+	at, err := time.Parse(time.RFC3339, entry.At)
+	if err != nil || at.Location() != time.UTC {
+		t.Fatalf("at %q is not UTC RFC3339: %v", entry.At, err)
+	}
+
+	// The stored record matches what the transition returned.
+	got, err := st.Get("INC-1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !reflect.DeepEqual(got, incident) {
+		t.Fatalf("stored %+v, want %+v", got, incident)
+	}
+}
+
+func TestTransitionWalksEveryStage(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+
+	if _, err := st.Register("INC-1", "low", "alice", []string{"a"}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	stages := []string{"遏制", "清除", "恢复", "关闭"}
+	var incident Incident
+	for i, stage := range stages {
+		owner := string(rune('a' + i))
+		incident, err = st.Transition("INC-1", stage, owner)
+		if err != nil {
+			t.Fatalf("transition to %s: %v", stage, err)
+		}
+		if incident.Stage != stage || incident.Owner != owner {
+			t.Fatalf("stage/owner = %q/%q, want %q/%q", incident.Stage, incident.Owner, stage, owner)
+		}
+		if len(incident.Timeline) != i+2 {
+			t.Fatalf("timeline length = %d, want %d", len(incident.Timeline), i+2)
+		}
+	}
+	for i, entry := range incident.Timeline {
+		want := append([]string{InitialStage}, stages...)[i]
+		if entry.Stage != want {
+			t.Fatalf("timeline[%d].Stage = %q, want %q", i, entry.Stage, want)
+		}
+	}
+}
+
+func TestTransitionRejectsInvalidMoves(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+
+	before, err := st.Register("INC-1", "medium", "alice", []string{"a"})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// Same stage, skipping ahead, and the initial stage are all illegal.
+	for _, stage := range []string{"受理", "清除", "恢复", "关闭"} {
+		if _, err := st.Transition("INC-1", stage, "bob"); !errors.Is(err, ErrInvalidTransition) {
+			t.Fatalf("transition to %s: err = %v, want ErrInvalidTransition", stage, err)
+		}
+	}
+	if _, err := st.Transition("INC-1", "遏制", "bob"); err != nil {
+		t.Fatalf("transition to 遏制: %v", err)
+	}
+	// Backwards and repeated moves are illegal too.
+	for _, stage := range []string{"受理", "遏制", "恢复", "关闭"} {
+		if _, err := st.Transition("INC-1", stage, "bob"); !errors.Is(err, ErrInvalidTransition) {
+			t.Fatalf("transition to %s: err = %v, want ErrInvalidTransition", stage, err)
+		}
+	}
+
+	// Failed transitions changed nothing beyond the one accepted move.
+	got, err := st.Get("INC-1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Stage != "遏制" || got.Owner != "bob" || len(got.Timeline) != 2 {
+		t.Fatalf("failed transitions mutated the incident: %+v", got)
+	}
+	if got.Timeline[0] != before.Timeline[0] {
+		t.Fatalf("history rewritten: %+v vs %+v", got.Timeline[0], before.Timeline[0])
+	}
+}
+
+func TestTransitionFromClosedIsInvalid(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+
+	if _, err := st.Register("INC-1", "low", "alice", []string{"a"}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	for _, stage := range []string{"遏制", "清除", "恢复", "关闭"} {
+		if _, err := st.Transition("INC-1", stage, "bob"); err != nil {
+			t.Fatalf("transition to %s: %v", stage, err)
+		}
+	}
+	for _, stage := range []string{"受理", "遏制", "清除", "恢复", "关闭"} {
+		if _, err := st.Transition("INC-1", stage, "carol"); !errors.Is(err, ErrInvalidTransition) {
+			t.Fatalf("transition from 关闭 to %s: err = %v, want ErrInvalidTransition", stage, err)
+		}
+	}
+	got, err := st.Get("INC-1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Stage != "关闭" || len(got.Timeline) != 5 {
+		t.Fatalf("closed incident changed: %+v", got)
+	}
+}
+
+func TestTransitionMissingIncident(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+
+	if _, err := st.Transition("nope", "遏制", "alice"); !errors.Is(err, ErrIncidentNotFound) {
+		t.Fatalf("err = %v, want ErrIncidentNotFound", err)
+	}
+}
+
+func TestTransitionConcurrentOnlyOneWins(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+
+	if _, err := st.Register("INC-1", "high", "alice", []string{"a"}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	const racers = 8
+	results := make(chan error, racers)
+	for i := 0; i < racers; i++ {
+		go func(i int) {
+			owner := string(rune('a' + i))
+			_, err := st.Transition("INC-1", "遏制", owner)
+			results <- err
+		}(i)
+	}
+	wins := 0
+	for i := 0; i < racers; i++ {
+		err := <-results
+		if err == nil {
+			wins++
+		} else if !errors.Is(err, ErrInvalidTransition) {
+			t.Fatalf("err = %v, want nil or ErrInvalidTransition", err)
+		}
+	}
+	if wins != 1 {
+		t.Fatalf("winners = %d, want exactly 1", wins)
+	}
+
+	got, err := st.Get("INC-1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Stage != "遏制" || len(got.Timeline) != 2 {
+		t.Fatalf("stage = %q timeline = %d, want 遏制 and 2", got.Stage, len(got.Timeline))
+	}
+	if got.Timeline[1].Owner != got.Owner {
+		t.Fatalf("owner %q does not match timeline owner %q", got.Owner, got.Timeline[1].Owner)
+	}
+}
+
+func TestTransitionSurvivesReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.db")
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := st.Register("INC-1", "critical", "alice", []string{"a", "b"}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	moved, err := st.Transition("INC-1", "遏制", "bob")
+	if err != nil {
+		t.Fatalf("transition: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+
+	got, err := reopened.Get("INC-1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !reflect.DeepEqual(got, moved) {
+		t.Fatalf("got %+v, want %+v", got, moved)
+	}
+}

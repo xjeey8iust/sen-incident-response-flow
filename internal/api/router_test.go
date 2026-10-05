@@ -691,3 +691,330 @@ func TestIncidentsPersistAcrossRestart(t *testing.T) {
 		t.Fatalf("restart changed the record: %v vs %v", fetched, created)
 	}
 }
+
+func transition(t *testing.T, baseURL, id, body string) (int, map[string]any) {
+	t.Helper()
+	return doRequest(t, http.MethodPost, baseURL+"/incidents/"+id+"/transition", body)
+}
+
+func TestTransitionWalksToClosed(t *testing.T) {
+	server, _ := newTestRouter(t)
+	status, created := doRequest(t, http.MethodPost, server.URL+"/incidents", validBody)
+	if status != http.StatusCreated {
+		t.Fatalf("register status = %d", status)
+	}
+
+	stages := []string{"遏制", "清除", "恢复", "关闭"}
+	owners := []string{"bob", "carol", "dave", "erin"}
+	var body map[string]any
+	for i, stage := range stages {
+		status, body = transition(t, server.URL, "INC-1", `{"stage":"`+stage+`","owner":"`+owners[i]+`"}`)
+		if status != http.StatusOK {
+			t.Fatalf("transition to %s: status = %d, want 200 (body %v)", stage, status, body)
+		}
+		if body["stage"] != stage || body["owner"] != owners[i] {
+			t.Fatalf("stage/owner = %v/%v, want %s/%s", body["stage"], body["owner"], stage, owners[i])
+		}
+		if body["id"] != "INC-1" || body["severity"] != "high" {
+			t.Fatalf("fixed fields changed: %v", body)
+		}
+		assets := body["assets"].([]any)
+		if len(assets) != 2 || assets[0] != "db-1" || assets[1] != "web-2" {
+			t.Fatalf("assets changed: %v", assets)
+		}
+		timeline := body["timeline"].([]any)
+		if len(timeline) != i+2 {
+			t.Fatalf("timeline length = %d, want %d", len(timeline), i+2)
+		}
+		entry := timeline[len(timeline)-1].(map[string]any)
+		if entry["stage"] != stage || entry["owner"] != owners[i] {
+			t.Fatalf("new timeline entry = %v", entry)
+		}
+		at, err := time.Parse(time.RFC3339, entry["at"].(string))
+		if err != nil || at.Location() != time.UTC {
+			t.Fatalf("at = %v, want UTC RFC3339 (%v)", entry["at"], err)
+		}
+		// The initial entry is untouched.
+		first := created["timeline"].([]any)[0].(map[string]any)
+		if timeline[0].(map[string]any)["at"] != first["at"] {
+			t.Fatalf("history rewritten: %v vs %v", timeline[0], first)
+		}
+	}
+
+	// Queries reflect the final stage.
+	status, fetched := doRequest(t, http.MethodGet, server.URL+"/incidents?id=INC-1", "")
+	if status != http.StatusOK || fetched["stage"] != "关闭" || fetched["owner"] != "erin" {
+		t.Fatalf("fetch after walk: status %d body %v", status, fetched)
+	}
+	_, items := listIncidents(t, server.URL+"/incidents?stage="+url.QueryEscape("关闭"))
+	if len(items) != 1 {
+		t.Fatalf("stage filter after walk = %v", items)
+	}
+	_, items = listIncidents(t, server.URL+"/incidents?stage="+url.QueryEscape("受理"))
+	if len(items) != 0 {
+		t.Fatalf("stale stage filter = %v", items)
+	}
+}
+
+func TestTransitionKeepsOwnerVerbatim(t *testing.T) {
+	server, _ := newTestRouter(t)
+	registerIncident(t, server.URL, "INC-1", "low", "alice")
+	// Surrounding whitespace is preserved; only all-blank owners are rejected.
+	status, body := transition(t, server.URL, "INC-1", `{"stage":"遏制","owner":" bob "}`)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %v)", status, body)
+	}
+	if body["owner"] != " bob " {
+		t.Fatalf("owner = %q, want verbatim %q", body["owner"], " bob ")
+	}
+}
+
+func TestTransitionRejectsInvalidBodies(t *testing.T) {
+	server, _ := newTestRouter(t)
+	registerIncident(t, server.URL, "INC-1", "high", "alice")
+	cases := map[string]string{
+		"empty body":          "",
+		"not json":            `nope`,
+		"json array":          `[]`,
+		"json scalar":         `"遏制"`,
+		"trailing object":     `{"stage":"遏制","owner":"bob"} {}`,
+		"unknown field":       `{"stage":"遏制","owner":"bob","id":"INC-1"}`,
+		"missing stage":       `{"owner":"bob"}`,
+		"missing owner":       `{"stage":"遏制"}`,
+		"null stage":          `{"stage":null,"owner":"bob"}`,
+		"null owner":          `{"stage":"遏制","owner":null}`,
+		"stage wrong type":    `{"stage":1,"owner":"bob"}`,
+		"owner wrong type":    `{"stage":"遏制","owner":["bob"]}`,
+		"blank owner":         `{"stage":"遏制","owner":"  "}`,
+		"empty owner":         `{"stage":"遏制","owner":""}`,
+		"unknown stage":       `{"stage":"修复","owner":"bob"}`,
+		"stage case variant":  `{"Stage":"遏制","owner":"bob"}`,
+		"owner case variant":  `{"stage":"遏制","Owner":"bob"}`,
+		"duplicate stage":     `{"stage":"遏制","stage":"遏制","owner":"bob"}`,
+		"duplicate owner":     `{"stage":"遏制","owner":"bob","owner":"carol"}`,
+		"escaped dup stage":   `{"stage":"遏制","` + escapeName("stage") + `":"清除","owner":"bob"}`,
+		"escaped dup owner":   `{"stage":"遏制","owner":"bob","` + escapeName("owner") + `":"carol"}`,
+		"escaped unknown key": `{"stage":"遏制","owner":"bob","` + escapeName("extra") + `":1}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			status, decoded := transition(t, server.URL, "INC-1", body)
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body %v)", status, decoded)
+			}
+			if len(decoded) != 1 {
+				t.Fatalf("error response must hold only the top-level error object: %v", decoded)
+			}
+			if code := errorCode(t, decoded); code != "invalid_request" {
+				t.Fatalf("code = %q, want invalid_request", code)
+			}
+		})
+	}
+
+	// Nothing changed.
+	status, fetched := doRequest(t, http.MethodGet, server.URL+"/incidents?id=INC-1", "")
+	if status != http.StatusOK || fetched["stage"] != "受理" || fetched["owner"] != "alice" ||
+		len(fetched["timeline"].([]any)) != 1 {
+		t.Fatalf("rejected bodies changed the incident: %v", fetched)
+	}
+}
+
+func TestTransitionValidationPrecedesLookup(t *testing.T) {
+	server, _ := newTestRouter(t)
+	// No incident registered at all: invalid bodies still win over the lookup.
+	for _, body := range []string{
+		`{"Stage":"遏制","owner":"bob"}`,
+		`{"stage":"遏制","stage":"遏制","owner":"bob"}`,
+		`{"stage":"未知","owner":"bob"}`,
+		`{"owner":" "}`,
+	} {
+		status, decoded := transition(t, server.URL, "GHOST", body)
+		if status != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want 400", body, status)
+		}
+		if code := errorCode(t, decoded); code != "invalid_request" {
+			t.Fatalf("%s: code = %q, want invalid_request", body, code)
+		}
+	}
+}
+
+func TestTransitionMissingIncidentReturns404(t *testing.T) {
+	server, _ := newTestRouter(t)
+	status, body := transition(t, server.URL, "GHOST", `{"stage":"遏制","owner":"bob"}`)
+	if status != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", status)
+	}
+	if code := errorCode(t, body); code != "incident_not_found" {
+		t.Fatalf("code = %q, want incident_not_found", code)
+	}
+}
+
+func TestTransitionRejectsIllegalMoves(t *testing.T) {
+	server, _ := newTestRouter(t)
+	registerIncident(t, server.URL, "INC-1", "medium", "alice")
+
+	// Current stage, backwards, and skipping all conflict.
+	for _, stage := range []string{"受理", "清除", "恢复", "关闭"} {
+		status, body := transition(t, server.URL, "INC-1", `{"stage":"`+stage+`","owner":"bob"}`)
+		if status != http.StatusConflict {
+			t.Fatalf("stage %s: status = %d, want 409", stage, status)
+		}
+		if code := errorCode(t, body); code != "invalid_transition" {
+			t.Fatalf("stage %s: code = %q, want invalid_transition", stage, code)
+		}
+	}
+
+	if status, _ := transition(t, server.URL, "INC-1", `{"stage":"遏制","owner":"bob"}`); status != http.StatusOK {
+		t.Fatalf("legal transition rejected")
+	}
+	// Now 受理 and 遏制 are both illegal targets.
+	for _, stage := range []string{"受理", "遏制", "恢复", "关闭"} {
+		status, _ := transition(t, server.URL, "INC-1", `{"stage":"`+stage+`","owner":"bob"}`)
+		if status != http.StatusConflict {
+			t.Fatalf("stage %s: status = %d, want 409", stage, status)
+		}
+	}
+
+	// Walk to 关闭; nothing may leave it.
+	for _, stage := range []string{"清除", "恢复", "关闭"} {
+		if status, _ := transition(t, server.URL, "INC-1", `{"stage":"`+stage+`","owner":"x"}`); status != http.StatusOK {
+			t.Fatalf("transition to %s rejected", stage)
+		}
+	}
+	for _, stage := range []string{"受理", "遏制", "清除", "恢复", "关闭"} {
+		status, body := transition(t, server.URL, "INC-1", `{"stage":"`+stage+`","owner":"x"}`)
+		if status != http.StatusConflict {
+			t.Fatalf("from 关闭 to %s: status = %d, want 409", stage, status)
+		}
+		if code := errorCode(t, body); code != "invalid_transition" {
+			t.Fatalf("from 关闭 to %s: code = %q", stage, code)
+		}
+	}
+
+	// Only the four accepted moves are in the history.
+	status, fetched := doRequest(t, http.MethodGet, server.URL+"/incidents?id=INC-1", "")
+	if status != http.StatusOK || fetched["stage"] != "关闭" || len(fetched["timeline"].([]any)) != 5 {
+		t.Fatalf("rejected transitions changed the incident: %v", fetched)
+	}
+}
+
+func TestTransitionConcurrentSameStageOneWinner(t *testing.T) {
+	server, _ := newTestRouter(t)
+	registerIncident(t, server.URL, "INC-1", "high", "alice")
+
+	const racers = 2
+	type outcome struct {
+		status int
+		body   map[string]any
+	}
+	results := make(chan outcome, racers)
+	for i := 0; i < racers; i++ {
+		go func(i int) {
+			owner := string(rune('a' + i))
+			status, body := transition(t, server.URL, "INC-1", `{"stage":"遏制","owner":"`+owner+`"}`)
+			results <- outcome{status, body}
+		}(i)
+	}
+	var winners, conflicts []outcome
+	for i := 0; i < racers; i++ {
+		result := <-results
+		switch result.status {
+		case http.StatusOK:
+			winners = append(winners, result)
+		case http.StatusConflict:
+			conflicts = append(conflicts, result)
+		default:
+			t.Fatalf("status = %d, want 200 or 409 (body %v)", result.status, result.body)
+		}
+	}
+	if len(winners) != 1 || len(conflicts) != 1 {
+		t.Fatalf("winners = %d conflicts = %d, want 1 and 1", len(winners), len(conflicts))
+	}
+	if code := errorCode(t, conflicts[0].body); code != "invalid_transition" {
+		t.Fatalf("loser code = %q, want invalid_transition", code)
+	}
+
+	// The stored owner belongs to the winning request and exactly one
+	// history entry was added.
+	winner := winners[0].body["owner"]
+	status, fetched := doRequest(t, http.MethodGet, server.URL+"/incidents?id=INC-1", "")
+	if status != http.StatusOK || fetched["stage"] != "遏制" || fetched["owner"] != winner {
+		t.Fatalf("stored incident = %v, want owner %q", fetched, winner)
+	}
+	timeline := fetched["timeline"].([]any)
+	if len(timeline) != 2 {
+		t.Fatalf("timeline length = %d, want 2", len(timeline))
+	}
+	if timeline[1].(map[string]any)["owner"] != winner {
+		t.Fatalf("timeline owner = %v, want %q", timeline[1], winner)
+	}
+}
+
+func TestTransitionSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "service.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	server := httptest.NewServer(NewRouter(st))
+	registerIncident(t, server.URL, "INC-1", "high", "alice")
+	status, moved := transition(t, server.URL, "INC-1", `{"stage":"遏制","owner":"bob"}`)
+	if status != http.StatusOK {
+		t.Fatalf("transition status = %d", status)
+	}
+	server.Close()
+	st.Close()
+
+	reopened, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	second := httptest.NewServer(NewRouter(reopened))
+	defer second.Close()
+
+	status, fetched := doRequest(t, http.MethodGet, second.URL+"/incidents?id=INC-1", "")
+	if status != http.StatusOK {
+		t.Fatalf("fetch after reopen: status %d", status)
+	}
+	if fetched["stage"] != "遏制" || fetched["owner"] != "bob" {
+		t.Fatalf("reopened incident = %v", fetched)
+	}
+	before := moved["timeline"].([]any)
+	after := fetched["timeline"].([]any)
+	if len(after) != len(before) {
+		t.Fatalf("timeline length changed across reopen: %v vs %v", before, after)
+	}
+	for i := range before {
+		if after[i].(map[string]any)["at"] != before[i].(map[string]any)["at"] ||
+			after[i].(map[string]any)["stage"] != before[i].(map[string]any)["stage"] ||
+			after[i].(map[string]any)["owner"] != before[i].(map[string]any)["owner"] {
+			t.Fatalf("history entry %d changed across reopen: %v vs %v", i, before[i], after[i])
+		}
+	}
+}
+
+func TestTransitionValidationPrecedesStorage(t *testing.T) {
+	server, st := newTestRouter(t)
+	registerIncident(t, server.URL, "INC-1", "medium", "alice")
+	st.Close()
+
+	// Invalid bodies are rejected even while the store is down.
+	status, body := transition(t, server.URL, "INC-1", `{"stage":"未知","owner":"bob"}`)
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", status)
+	}
+	if code := errorCode(t, body); code != "invalid_request" {
+		t.Fatalf("code = %q, want invalid_request", code)
+	}
+
+	// A valid body surfaces the storage failure.
+	status, body = transition(t, server.URL, "INC-1", `{"stage":"遏制","owner":"bob"}`)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", status)
+	}
+	if code := errorCode(t, body); code != "storage_unavailable" {
+		t.Fatalf("code = %q, want storage_unavailable", code)
+	}
+}

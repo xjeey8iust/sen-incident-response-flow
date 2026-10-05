@@ -16,6 +16,20 @@ import (
 // InitialStage is the stage every incident starts in when it is registered.
 const InitialStage = "受理"
 
+// stageOrder lists the stages in the only order an incident may follow.
+var stageOrder = []string{"受理", "遏制", "清除", "恢复", "关闭"}
+
+// nextStage returns the stage a transition may move to from current, or ""
+// when current is the final stage.
+func nextStage(current string) string {
+	for i, stage := range stageOrder {
+		if stage == current && i+1 < len(stageOrder) {
+			return stageOrder[i+1]
+		}
+	}
+	return ""
+}
+
 // TimelineEntry records one stage of an incident's life together with the
 // owner responsible at that point and the UTC time the entry was created.
 type TimelineEntry struct {
@@ -41,6 +55,10 @@ var ErrIncidentConflict = errors.New("incident id already registered with differ
 // ErrIncidentNotFound is returned when no incident exists for an id.
 var ErrIncidentNotFound = errors.New("incident not found")
 
+// ErrInvalidTransition is returned when a transition does not advance the
+// incident exactly one stage along stageOrder.
+var ErrInvalidTransition = errors.New("transition must advance exactly one stage")
+
 // Store wraps the SQLite handle so callers never touch database/sql directly.
 type Store struct {
 	db *sql.DB
@@ -52,6 +70,10 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
+	// A single connection serializes every read and write, so concurrent
+	// transitions settle through the conditional UPDATE instead of racing
+	// two writers into SQLITE_BUSY.
+	db.SetMaxOpenConns(1)
 	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("enable wal: %w", err)
@@ -132,6 +154,73 @@ func (s *Store) Get(id string) (Incident, error) {
 		return Incident{}, ErrIncidentNotFound
 	}
 	return *incident, nil
+}
+
+// Transition advances the incident one stage along stageOrder, switching the
+// owner and appending one timeline entry in the same transaction. Any other
+// move — staying, going back, skipping, or leaving the final stage — yields
+// ErrInvalidTransition and changes nothing; an unknown id yields
+// ErrIncidentNotFound. When two transitions race for the same next stage the
+// conditional UPDATE lets exactly one commit; the loser re-reads the row and
+// reports ErrInvalidTransition.
+func (s *Store) Transition(id, stage, owner string) (Incident, error) {
+	existing, err := s.find(id)
+	if err != nil {
+		return Incident{}, err
+	}
+	if existing == nil {
+		return Incident{}, ErrIncidentNotFound
+	}
+	if nextStage(existing.Stage) != stage {
+		return Incident{}, ErrInvalidTransition
+	}
+	at := time.Now().UTC().Format(time.RFC3339)
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return Incident{}, fmt.Errorf("begin transition: %w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(
+		"UPDATE incidents SET stage = ?, owner = ? WHERE id = ? AND stage = ?",
+		stage, owner, id, existing.Stage,
+	)
+	if err != nil {
+		return Incident{}, fmt.Errorf("transition incident: %w", err)
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return Incident{}, fmt.Errorf("transition incident: %w", err)
+	}
+	if updated == 0 {
+		// A concurrent transition moved the incident first. Roll back before
+		// re-reading: the single connection stays with this transaction
+		// until then.
+		tx.Rollback()
+		current, findErr := s.find(id)
+		if findErr != nil {
+			return Incident{}, findErr
+		}
+		if current == nil {
+			return Incident{}, ErrIncidentNotFound
+		}
+		return Incident{}, ErrInvalidTransition
+	}
+	if _, err = tx.Exec(
+		"INSERT INTO incident_timeline (incident_id, seq, stage, owner, at) VALUES (?, ?, ?, ?, ?)",
+		id, len(existing.Timeline), stage, owner, at,
+	); err != nil {
+		return Incident{}, fmt.Errorf("append timeline: %w", err)
+	}
+	if err = tx.Commit(); err != nil {
+		return Incident{}, fmt.Errorf("commit transition: %w", err)
+	}
+
+	incident := *existing
+	incident.Stage = stage
+	incident.Owner = owner
+	incident.Timeline = append(slices.Clone(existing.Timeline), TimelineEntry{Stage: stage, Owner: owner, At: at})
+	return incident, nil
 }
 
 // List returns every incident matching the optional severity and stage
