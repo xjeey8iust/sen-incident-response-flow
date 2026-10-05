@@ -229,6 +229,10 @@ func (s *Store) Get(id string) (Incident, error) {
 
 // List returns every incident matching the optional severity and stage
 // filters, ordered by id in UTF-8 byte order. Empty filters match everything.
+// The filter, the incident bodies, and every timeline are read inside one
+// transaction, so the whole result reflects a single committed state: a
+// transition committing while the list is assembled cannot mix an old body
+// with a new history.
 func (s *Store) List(severity, stage string) ([]Incident, error) {
 	query := "SELECT id, severity, assets, stage, owner FROM incidents"
 	var clauses []string
@@ -246,7 +250,13 @@ func (s *Store) List(severity, stage string) ([]Incident, error) {
 	}
 	query += " ORDER BY id"
 
-	rows, err := s.db.Query(query, args...)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin list: %w", err)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list incidents: %w", err)
 	}
@@ -266,37 +276,45 @@ func (s *Store) List(severity, stage string) ([]Incident, error) {
 	rows.Close()
 
 	for i := range incidents {
-		timeline, err := s.timeline(incidents[i].ID)
+		timeline, err := queryTimeline(tx, incidents[i].ID)
 		if err != nil {
 			return nil, err
 		}
 		incidents[i].Timeline = timeline
 	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit list: %w", err)
+	}
 	return incidents, nil
 }
 
-// find loads one incident by id, returning nil when it does not exist.
+// find loads one incident by id, returning nil when it does not exist. The
+// body and the timeline are read inside one transaction so both come from
+// the same committed state even when a transition commits concurrently.
 func (s *Store) find(id string) (*Incident, error) {
-	row := s.db.QueryRow(
-		"SELECT id, severity, assets, stage, owner FROM incidents WHERE id = ?", id)
-	incident, err := scanIncident(row)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin read: %w", err)
+	}
+	defer tx.Rollback()
+
+	incident, err := scanIncident(tx.QueryRow(
+		"SELECT id, severity, assets, stage, owner FROM incidents WHERE id = ?", id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	timeline, err := s.timeline(id)
+	timeline, err := queryTimeline(tx, id)
 	if err != nil {
 		return nil, err
 	}
 	incident.Timeline = timeline
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit read: %w", err)
+	}
 	return &incident, nil
-}
-
-// timeline loads the transition history of one incident in entry order.
-func (s *Store) timeline(id string) ([]TimelineEntry, error) {
-	return queryTimeline(s.db, id)
 }
 
 // queryTimeline is timeline against any handle, so a transaction can read

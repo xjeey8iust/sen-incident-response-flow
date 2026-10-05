@@ -1036,3 +1036,241 @@ func TestTransitionPersistsAcrossRestart(t *testing.T) {
 		t.Fatalf("timeline after restart = %v", body["timeline"])
 	}
 }
+
+// stageSequence is the only order an incident's history may walk.
+var stageSequence = []string{"受理", "遏制", "清除", "恢复", "关闭"}
+
+// inconsistentBody describes how a decoded incident object mixes committed
+// states, or returns "" when it is internally consistent: the history must
+// walk the stage order from 受理 and the body's stage and owner must match
+// the last history entry.
+func inconsistentBody(body map[string]any) string {
+	timeline, ok := body["timeline"].([]any)
+	if !ok || len(timeline) == 0 || len(timeline) > len(stageSequence) {
+		return fmt.Sprintf("timeline = %v", body["timeline"])
+	}
+	for i, item := range timeline {
+		entry, ok := item.(map[string]any)
+		if !ok || entry["stage"] != stageSequence[i] {
+			return fmt.Sprintf("history entry %d = %v, want stage %q", i, item, stageSequence[i])
+		}
+	}
+	last := timeline[len(timeline)-1].(map[string]any)
+	if body["stage"] != last["stage"] || body["owner"] != last["owner"] {
+		return fmt.Sprintf("body stage/owner %v/%v but last history entry is %v",
+			body["stage"], body["owner"], last)
+	}
+	return ""
+}
+
+// fetchIncident performs GET url and decodes a single incident object. It
+// reports through its return values instead of t.Fatalf so concurrent
+// readers can use it from their own goroutines.
+func fetchIncident(url string) (int, map[string]any, error) {
+	response, err := http.Get(url)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer response.Body.Close()
+	var decoded map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&decoded); err != nil {
+		return 0, nil, err
+	}
+	return response.StatusCode, decoded, nil
+}
+
+// fetchList is fetchIncident for the array-returning list queries.
+func fetchList(url string) (int, []any, error) {
+	response, err := http.Get(url)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer response.Body.Close()
+	var decoded []any
+	if err := json.NewDecoder(response.Body).Decode(&decoded); err != nil {
+		return 0, nil, err
+	}
+	return response.StatusCode, decoded, nil
+}
+
+func TestGetReturnsOneCommittedStateDuringTransitions(t *testing.T) {
+	server, _ := newTestRouter(t)
+	registerIncident(t, server.URL, "INC-1", "high", "alice")
+
+	status, initial := doRequest(t, http.MethodGet, server.URL+"/incidents?id=INC-1", "")
+	if status != http.StatusOK {
+		t.Fatalf("initial fetch status = %d", status)
+	}
+	initialAt := initial["timeline"].([]any)[0].(map[string]any)["at"]
+
+	// Concurrent readers race a walk through every stage; each response must
+	// be one committed state: either the 受理/alice body with only the
+	// initial history, or a later stage whose body matches its history.
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				status, body, err := fetchIncident(server.URL + "/incidents?id=INC-1")
+				if err != nil {
+					t.Errorf("get: %v", err)
+					return
+				}
+				if status != http.StatusOK {
+					t.Errorf("status = %d, want 200 (%v)", status, body)
+					return
+				}
+				if msg := inconsistentBody(body); msg != "" {
+					t.Errorf("mixed committed states: %s", msg)
+					return
+				}
+			}
+		}()
+	}
+
+	owners := []string{"bob", "carol", "dave", "erin"}
+	for i, stage := range stageSequence[1:] {
+		body := `{"stage":"` + stage + `","owner":"` + owners[i] + `"}`
+		if status, resp := transition(t, server.URL, "INC-1", body); status != http.StatusOK {
+			t.Fatalf("transition to %s: status = %d (%v)", stage, status, resp)
+		}
+	}
+	close(done)
+	wg.Wait()
+
+	// A query issued after the transitions returned shows the final stage
+	// and owner with the complete history in transition order, the original
+	// timestamps untouched.
+	status, fetched := doRequest(t, http.MethodGet, server.URL+"/incidents?id=INC-1", "")
+	if status != http.StatusOK {
+		t.Fatalf("final fetch status = %d", status)
+	}
+	if fetched["stage"] != "关闭" || fetched["owner"] != "erin" {
+		t.Fatalf("final incident = %v, want 关闭/erin", fetched)
+	}
+	timeline := fetched["timeline"].([]any)
+	if len(timeline) != len(stageSequence) {
+		t.Fatalf("timeline length = %d, want %d", len(timeline), len(stageSequence))
+	}
+	wantOwners := append([]string{"alice"}, owners...)
+	for i, item := range timeline {
+		entry := item.(map[string]any)
+		if entry["stage"] != stageSequence[i] || entry["owner"] != wantOwners[i] {
+			t.Fatalf("history entry %d = %v, want %q/%q", i, entry, stageSequence[i], wantOwners[i])
+		}
+	}
+	if timeline[0].(map[string]any)["at"] != initialAt {
+		t.Fatalf("initial timestamp changed: %v vs %v", timeline[0], initialAt)
+	}
+}
+
+func TestListReturnsOneCommittedStateDuringTransitions(t *testing.T) {
+	server, _ := newTestRouter(t)
+	registerIncident(t, server.URL, "INC-1", "high", "alice")
+	registerIncident(t, server.URL, "INC-2", "high", "bob")
+	registerIncident(t, server.URL, "INC-3", "low", "carol")
+
+	// Unfiltered, stage-filtered, and combined queries race transitions of
+	// INC-1 and INC-2: every item must be internally consistent and satisfy
+	// the filter, and ids must stay in byte order.
+	queries := []struct {
+		path     string
+		severity string
+		stage    string
+	}{
+		{"/incidents", "", ""},
+		{"/incidents?stage=" + url.QueryEscape("受理"), "", "受理"},
+		{"/incidents?severity=high&stage=" + url.QueryEscape("受理"), "high", "受理"},
+	}
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, query := range queries {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				status, items, err := fetchList(server.URL + query.path)
+				if err != nil {
+					t.Errorf("list %s: %v", query.path, err)
+					return
+				}
+				if status != http.StatusOK {
+					t.Errorf("list %s: status = %d, want 200", query.path, status)
+					return
+				}
+				previous := ""
+				for _, item := range items {
+					body := item.(map[string]any)
+					if msg := inconsistentBody(body); msg != "" {
+						t.Errorf("list %s: %s", query.path, msg)
+						return
+					}
+					if query.severity != "" && body["severity"] != query.severity {
+						t.Errorf("list %s returned severity %v", query.path, body["severity"])
+						return
+					}
+					if query.stage != "" && body["stage"] != query.stage {
+						t.Errorf("list %s returned stage %v", query.path, body["stage"])
+						return
+					}
+					id := body["id"].(string)
+					if previous != "" && previous >= id {
+						t.Errorf("list %s ids out of order: %q then %q", query.path, previous, id)
+						return
+					}
+					previous = id
+				}
+			}
+		}()
+	}
+
+	for _, id := range []string{"INC-1", "INC-2"} {
+		body := `{"stage":"遏制","owner":"owner-` + id + `"}`
+		if status, resp := transition(t, server.URL, id, body); status != http.StatusOK {
+			t.Fatalf("transition %s: status = %d (%v)", id, status, resp)
+		}
+	}
+	close(done)
+	wg.Wait()
+
+	// Queries issued after the transitions returned reflect the new state:
+	// stage filters move incidents between buckets and the combined filter
+	// stays the intersection.
+	_, items := listIncidents(t, server.URL+"/incidents?stage="+url.QueryEscape("受理"))
+	if len(items) != 1 || items[0].(map[string]any)["id"] != "INC-3" {
+		t.Fatalf("受理 filter = %v, want only INC-3", items)
+	}
+
+	_, items = listIncidents(t, server.URL+"/incidents?severity=high&stage="+url.QueryEscape("遏制"))
+	if len(items) != 2 ||
+		items[0].(map[string]any)["id"] != "INC-1" ||
+		items[1].(map[string]any)["id"] != "INC-2" {
+		t.Fatalf("high/遏制 filter = %v, want INC-1 and INC-2", items)
+	}
+	for _, item := range items {
+		body := item.(map[string]any)
+		timeline := body["timeline"].([]any)
+		last := timeline[len(timeline)-1].(map[string]any)
+		if len(timeline) != 2 || last["stage"] != "遏制" ||
+			last["owner"] != body["owner"] || body["stage"] != "遏制" {
+			t.Fatalf("contained incident = %v, want two entries ending at its stage/owner", body)
+		}
+	}
+
+	_, items = listIncidents(t, server.URL+"/incidents?severity=low&stage="+url.QueryEscape("遏制"))
+	if len(items) != 0 {
+		t.Fatalf("low/遏制 filter = %v, want empty", items)
+	}
+}

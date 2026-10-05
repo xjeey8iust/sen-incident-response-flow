@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"sync"
@@ -438,5 +439,190 @@ func TestTransitionConcurrentSameStage(t *testing.T) {
 	}
 	if got.Stage != "遏制" || got.Owner != "racer" || len(got.Timeline) != 2 {
 		t.Fatalf("incident = %+v, want one transition and two entries", got)
+	}
+}
+
+// inconsistent describes how an incident mixes committed states, or returns
+// "" when it is internally consistent: the history must walk the stage order
+// from 受理 and the body's stage and owner must match the last history entry.
+func inconsistent(incident Incident) string {
+	if len(incident.Timeline) == 0 || len(incident.Timeline) > len(stageOrder) {
+		return fmt.Sprintf("timeline length %d: %+v", len(incident.Timeline), incident)
+	}
+	for i, entry := range incident.Timeline {
+		if entry.Stage != stageOrder[i] {
+			return fmt.Sprintf("history entry %d is %q, want %q: %+v", i, entry.Stage, stageOrder[i], incident)
+		}
+	}
+	last := incident.Timeline[len(incident.Timeline)-1]
+	if incident.Stage != last.Stage || incident.Owner != last.Owner {
+		return fmt.Sprintf("body stage/owner %q/%q but last history entry is %+v",
+			incident.Stage, incident.Owner, last)
+	}
+	return ""
+}
+
+func TestGetReadsSingleCommittedState(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+
+	registered, err := st.Register("INC-1", "high", "alice", []string{"a"})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// Readers race a walk through every stage; each read must show one
+	// committed state, never an old body with a new history or vice versa.
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				incident, err := st.Get("INC-1")
+				if err != nil {
+					t.Errorf("get: %v", err)
+					return
+				}
+				if msg := inconsistent(incident); msg != "" {
+					t.Errorf("mixed committed states: %s", msg)
+					return
+				}
+			}
+		}()
+	}
+
+	owners := []string{"bob", "carol", "dave", "erin"}
+	for i, stage := range stageOrder[1:] {
+		if _, err := st.Transition("INC-1", stage, owners[i]); err != nil {
+			t.Fatalf("transition to %s: %v", stage, err)
+		}
+	}
+	close(done)
+	wg.Wait()
+
+	// A read after the transitions returned shows the final state with the
+	// complete, unmodified history.
+	got, err := st.Get("INC-1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Stage != "关闭" || got.Owner != "erin" || len(got.Timeline) != 5 {
+		t.Fatalf("final incident = %+v, want 关闭/erin with five entries", got)
+	}
+	for i, entry := range got.Timeline {
+		if entry.Stage != stageOrder[i] {
+			t.Fatalf("history entry %d = %q, want %q", i, entry.Stage, stageOrder[i])
+		}
+	}
+	if got.Timeline[0] != registered.Timeline[0] {
+		t.Fatalf("initial history entry changed: %+v vs %+v", got.Timeline[0], registered.Timeline[0])
+	}
+}
+
+func TestListReadsSingleCommittedState(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+
+	for _, item := range []struct{ id, severity, owner string }{
+		{"INC-1", "high", "alice"},
+		{"INC-2", "high", "bob"},
+		{"INC-3", "low", "carol"},
+	} {
+		if _, err := st.Register(item.id, item.severity, item.owner, []string{"a"}); err != nil {
+			t.Fatalf("register %s: %v", item.id, err)
+		}
+	}
+
+	// Filtered and unfiltered lists race transitions: every item must be
+	// internally consistent, satisfy the filter, and keep id byte order.
+	filters := []struct{ severity, stage string }{
+		{"", ""},
+		{"", "受理"},
+		{"high", "受理"},
+	}
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, filter := range filters {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				incidents, err := st.List(filter.severity, filter.stage)
+				if err != nil {
+					t.Errorf("list %q/%q: %v", filter.severity, filter.stage, err)
+					return
+				}
+				for i, incident := range incidents {
+					if msg := inconsistent(incident); msg != "" {
+						t.Errorf("list %q/%q: %s", filter.severity, filter.stage, msg)
+						return
+					}
+					if filter.severity != "" && incident.Severity != filter.severity {
+						t.Errorf("list %q/%q returned severity %q: %+v",
+							filter.severity, filter.stage, incident.Severity, incident)
+						return
+					}
+					if filter.stage != "" && incident.Stage != filter.stage {
+						t.Errorf("list %q/%q returned stage %q: %+v",
+							filter.severity, filter.stage, incident.Stage, incident)
+						return
+					}
+					if i > 0 && incidents[i-1].ID >= incident.ID {
+						t.Errorf("list %q/%q ids out of order: %+v",
+							filter.severity, filter.stage, incidents)
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	for _, id := range []string{"INC-1", "INC-2"} {
+		if _, err := st.Transition(id, "遏制", "owner-"+id); err != nil {
+			t.Fatalf("transition %s: %v", id, err)
+		}
+	}
+	close(done)
+	wg.Wait()
+
+	// Lists issued after the transitions returned reflect the new stages.
+	accepted, err := st.List("", "受理")
+	if err != nil {
+		t.Fatalf("list 受理: %v", err)
+	}
+	if len(accepted) != 1 || accepted[0].ID != "INC-3" {
+		t.Fatalf("受理 filter = %+v, want only INC-3", accepted)
+	}
+
+	contained, err := st.List("high", "遏制")
+	if err != nil {
+		t.Fatalf("list high/遏制: %v", err)
+	}
+	if len(contained) != 2 || contained[0].ID != "INC-1" || contained[1].ID != "INC-2" {
+		t.Fatalf("high/遏制 filter = %+v, want INC-1 and INC-2", contained)
+	}
+	for _, incident := range contained {
+		if len(incident.Timeline) != 2 || incident.Timeline[1].Stage != "遏制" ||
+			incident.Timeline[1].Owner != incident.Owner {
+			t.Fatalf("contained incident = %+v, want two entries ending at its stage/owner", incident)
+		}
 	}
 }
