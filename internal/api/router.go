@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -115,7 +116,17 @@ func (r *registerRequest) valid() bool {
 
 func queryIncidents(st *store.Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		query := c.Request.URL.Query()
+		// Parse the whole raw query and honor the parse error. url.ParseQuery
+		// returns the pairs it managed to decode alongside an error; the
+		// default URL.Query helper discards that error, which would let a
+		// malformed fragment such as severity=%ZZ vanish and silently turn
+		// into an unfiltered list. Every fragment must parse before any pair
+		// is consulted.
+		query, err := url.ParseQuery(c.Request.URL.RawQuery)
+		if err != nil {
+			writeInvalidQuery(c)
+			return
+		}
 		for key, values := range query {
 			if key != "severity" && key != "stage" && key != "id" {
 				writeInvalidQuery(c)

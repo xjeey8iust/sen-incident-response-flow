@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -369,4 +370,278 @@ func TestIncidentsPersistAcrossRestart(t *testing.T) {
 		fetchedTimeline[0].(map[string]any)["at"] != createdTimeline[0].(map[string]any)["at"] {
 		t.Fatalf("restart changed the record: %v vs %v", fetched, created)
 	}
+}
+
+// assertInvalidQueryShape locks the published 400 contract: exactly one
+// top-level error object holding two strings, never the parser's own text.
+func assertInvalidQueryShape(t *testing.T, rawQuery string, body map[string]any) {
+	t.Helper()
+	if len(body) != 1 {
+		t.Fatalf("response has keys beyond error: %v", body)
+	}
+	errObj, ok := body["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("response has no top-level error object: %v", body)
+	}
+	if len(errObj) != 2 {
+		t.Fatalf("error object must hold only code and message: %v", errObj)
+	}
+	code, ok := errObj["code"].(string)
+	if !ok || code != "invalid_query" {
+		t.Fatalf("error.code = %v, want invalid_query", errObj["code"])
+	}
+	message, ok := errObj["message"].(string)
+	if !ok || message != "query parameters are missing, repeated, unknown, or hold invalid values" {
+		t.Fatalf("error.message = %v, want the published invalid_query text", errObj["message"])
+	}
+	// Parser diagnostics, SQL, stacks, and file paths must never leak, and the
+	// offending fragment must not be echoed back verbatim.
+	for _, leaked := range []string{"%ZZ", "%2G", "invalid URL escape", "semicolon separator", ".go", "sql:"} {
+		if strings.Contains(message, leaked) {
+			t.Fatalf("message leaks %q: %q", leaked, message)
+		}
+	}
+	if rawQuery != "" && strings.Contains(message, rawQuery) {
+		t.Fatalf("message echoes the raw query %q: %q", rawQuery, message)
+	}
+}
+
+// TestQueryMalformedFragmentsRejected is the core regression: a fragment that
+// fails percent-decoding or carries a raw semicolon must reject the whole
+// request. Previously url.Values dropped the parse error and only the
+// parseable survivors were acted on, turning severity=%ZZ into an unfiltered
+// list and id=INC-1&stage=%ZZ into a single-ticket lookup.
+func TestQueryMalformedFragmentsRejected(t *testing.T) {
+	server, _ := newTestRouter(t)
+	registerIncident(t, server.URL, "INC-1", "medium", "alice")
+
+	cases := []string{
+		"severity=%ZZ",               // non-hex value used to become an unfiltered list
+		"sev%erity=high",             // non-hex escape in the parameter name
+		"severity=%",                 // lone percent in value
+		"severity=%2",                // truncated percent escape
+		"severity=%2G",               // non-hex digit
+		"%ZZ=high",                   // malformed name only
+		"id=INC-1&stage=%ZZ",         // existing id keeps a malformed filter
+		"stage=%ZZ&id=INC-1",         // malformed fragment first, existing id after
+		"id=missing&stage=%ZZ",       // missing id must not yield 404
+		"stage=%ZZ&id=missing",       // malformed first, missing id after
+		"id=INC-1%ZZ",                // malformed id value must not resolve to INC-1
+		"severity=high&%ZZ=1",        // malformed unknown fragment after a valid one
+		"id=INC-1&%ZZ=1",             // malformed unknown fragment next to a hit
+		"foo=%ZZ",                    // a malformed unknown parameter must not be dropped
+		"severity=high&severity=%ZZ", // a malformed duplicate must not collapse away
+		"severity=%ZZ&severity=high", // malformed duplicate first
+		"id=INC-1;x=y",               // raw semicolon must not act as a separator
+		"foo=a;b",                    // raw semicolon inside a value
+		";severity=high",             // fragment beginning with a semicolon
+	}
+	for _, rawQuery := range cases {
+		t.Run(rawQuery, func(t *testing.T) {
+			status, body := doRequest(t, http.MethodGet, server.URL+"/incidents?"+rawQuery, "")
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body %v)", status, body)
+			}
+			assertInvalidQueryShape(t, rawQuery, body)
+
+			// A malformed query must never surface as a partial success:
+			// neither a list/single object nor a 404 for a surviving id.
+			if _, isError := body["error"]; !isError {
+				t.Fatalf("expected a bare error response, got %v", body)
+			}
+		})
+	}
+
+	// An encoded semicolon is a legal value character, so this is simply an id
+	// lookup that misses — 404 incident_not_found, never the 400 reserved for a
+	// raw semicolon.
+	status, body := doRequest(t, http.MethodGet, server.URL+"/incidents?id=INC-1%3BX", "")
+	if status != http.StatusNotFound {
+		t.Fatalf("encoded-semicolon id status = %d, want 404", status)
+	}
+	if code := errorCode(t, body); code != "incident_not_found" {
+		t.Fatalf("code = %q, want incident_not_found", code)
+	}
+}
+
+// TestQueryMalformedFragmentsRejectedWhenStorageDown proves validation runs
+// before the store is consulted: an unparseable query is 400 even when storage
+// is unavailable, while a legal query on the same dead store still reaches it.
+func TestQueryMalformedFragmentsRejectedWhenStorageDown(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "service.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	server := httptest.NewServer(NewRouter(st))
+	defer server.Close()
+
+	// Control: the store really is unavailable for a legal query.
+	status, body := doRequest(t, http.MethodGet, server.URL+"/incidents", "")
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("legal query on dead store: status = %d, want 503", status)
+	}
+	if code := errorCode(t, body); code != "storage_unavailable" {
+		t.Fatalf("code = %q, want storage_unavailable", code)
+	}
+
+	for _, rawQuery := range []string{"severity=%ZZ", "id=INC-1&stage=%ZZ", "id=INC-1;x=y"} {
+		t.Run(rawQuery, func(t *testing.T) {
+			status, body := doRequest(t, http.MethodGet, server.URL+"/incidents?"+rawQuery, "")
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (dead store must not turn this into 503)", status)
+			}
+			assertInvalidQueryShape(t, rawQuery, body)
+		})
+	}
+}
+
+// TestQueryMalformedFragmentsDoNotMutateRecords ensures rejected queries leave
+// stored tickets and their timelines untouched.
+func TestQueryMalformedFragmentsDoNotMutateRecords(t *testing.T) {
+	server, _ := newTestRouter(t)
+	registerIncident(t, server.URL, "INC-1", "medium", "alice")
+
+	status, before := doRequest(t, http.MethodGet, server.URL+"/incidents?id=INC-1", "")
+	if status != http.StatusOK {
+		t.Fatalf("snapshot status = %d", status)
+	}
+	status, listBefore := listIncidents(t, server.URL+"/incidents")
+	if status != http.StatusOK || len(listBefore) != 1 {
+		t.Fatalf("list before = %d (status %d)", len(listBefore), status)
+	}
+
+	malformed := []string{
+		"severity=%ZZ",
+		"id=INC-1&stage=%ZZ",
+		"stage=%ZZ&id=INC-1",
+		"id=INC-1%ZZ",
+		"id=INC-1;x=y",
+		"foo=%ZZ",
+	}
+	for _, rawQuery := range malformed {
+		if status, _ := doRequest(t, http.MethodGet, server.URL+"/incidents?"+rawQuery, ""); status != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want 400", rawQuery, status)
+		}
+	}
+
+	status, after := doRequest(t, http.MethodGet, server.URL+"/incidents?id=INC-1", "")
+	if status != http.StatusOK {
+		t.Fatalf("post-rejection fetch status = %d", status)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("rejected query changed the incident:\nbefore=%v\nafter =%v", before, after)
+	}
+	status, listAfter := listIncidents(t, server.URL+"/incidents")
+	if status != http.StatusOK || len(listAfter) != 1 {
+		t.Fatalf("list after = %d (status %d), want the single original record", len(listAfter), status)
+	}
+}
+
+// TestQueryDecodesNamesThenValidates ensures names and values are decoded
+// exactly once and then recognized: an encoded known name works, an encoded
+// duplicate name collides with its plain form, and an encoded unknown name is
+// still unknown.
+func TestQueryDecodesNamesThenValidates(t *testing.T) {
+	server, _ := newTestRouter(t)
+	registerIncident(t, server.URL, "INC-1", "high", "alice")
+	registerIncident(t, server.URL, "INC-2", "low", "bob")
+
+	// Encoded known parameter name (%73 == 's') filters normally.
+	status, items := listIncidents(t, server.URL+"/incidents?%73everity=high")
+	if status != http.StatusOK || len(items) != 1 {
+		t.Fatalf("encoded severity name: status %d items %d", status, len(items))
+	}
+
+	// %73everity and severity decode to the same name: a duplicate.
+	for _, rawQuery := range []string{
+		"%73everity=high&severity=high",
+		"severity=high&%73everity=low",
+		"%69d=INC-1&id=INC-1", // %69 == 'i'
+	} {
+		t.Run(rawQuery, func(t *testing.T) {
+			status, body := doRequest(t, http.MethodGet, server.URL+"/incidents?"+rawQuery, "")
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", status)
+			}
+			assertInvalidQueryShape(t, rawQuery, body)
+		})
+	}
+
+	// An encoded unknown name is unknown after decoding.
+	status, body := doRequest(t, http.MethodGet, server.URL+"/incidents?%66oo=bar", "")
+	if status != http.StatusBadRequest {
+		t.Fatalf("encoded unknown name status = %d, want 400", status)
+	}
+	if code := errorCode(t, body); code != "invalid_query" {
+		t.Fatalf("code = %q, want invalid_query", code)
+	}
+
+	// Values decode once: %68igh -> high and matches; %2568igh -> %68igh,
+	// which is not a severity rather than decoding a second time to high.
+	status, items = listIncidents(t, server.URL+"/incidents?severity=%68igh")
+	if status != http.StatusOK || len(items) != 1 {
+		t.Fatalf("single-decoded severity: status %d items %d", status, len(items))
+	}
+	status, body = doRequest(t, http.MethodGet, server.URL+"/incidents?severity=%2568igh", "")
+	if status != http.StatusBadRequest {
+		t.Fatalf("double-decoded severity status = %d, want 400", status)
+	}
+	if code := errorCode(t, body); code != "invalid_query" {
+		t.Fatalf("code = %q, want invalid_query", code)
+	}
+}
+
+// TestQuerySpecialCharacterIDs covers the preserved decoding semantics:
+// percent-encoded ; & + are literal id characters and never split the query,
+// a plain '+' still means a space, and encoded Chinese keeps filtering.
+func TestQuerySpecialCharacterIDs(t *testing.T) {
+	server, _ := newTestRouter(t)
+	registerIncident(t, server.URL, `INC;A&B+C`, "high", "alice")
+	registerIncident(t, server.URL, "INC X", "medium", "bob")
+	registerIncident(t, server.URL, "INC+X", "low", "carol")
+
+	// Encoded ; & + match the full id as stored and are not treated as query
+	// delimiters (%3B ';', %26 '&', %2B '+').
+	status, body := doRequest(t, http.MethodGet, server.URL+"/incidents?id=INC%3BA%26B%2BC", "")
+	if status != http.StatusOK {
+		t.Fatalf("encoded special-char id: status = %d, want 200 (%v)", status, body)
+	}
+	if body["id"] != `INC;A&B+C` {
+		t.Fatalf("id = %v, want INC;A&B+C", body["id"])
+	}
+
+	// A plain plus is a space: INC+X decodes to "INC X".
+	status, body = doRequest(t, http.MethodGet, server.URL+"/incidents?id=INC+X", "")
+	if status != http.StatusOK || body["id"] != "INC X" {
+		t.Fatalf("plain plus: status %d id %v, want INC X", status, body["id"])
+	}
+	// %2B is a literal plus: INC%2BX decodes to "INC+X".
+	status, body = doRequest(t, http.MethodGet, server.URL+"/incidents?id=INC%2BX", "")
+	if status != http.StatusOK || body["id"] != "INC+X" {
+		t.Fatalf("encoded plus: status %d id %v, want INC+X", status, body["id"])
+	}
+
+	// Encoded Chinese stage keeps filtering; every registered ticket starts in
+	// 受理 (percent-encoded UTF-8 below).
+	status, items := listIncidents(t, server.URL+"/incidents?stage=%E5%8F%97%E7%90%86")
+	if status != http.StatusOK || len(items) != 3 {
+		t.Fatalf("encoded stage filter: status %d items %d, want 3", status, len(items))
+	}
+}
+
+// TestQueryMalformedUTF8ValueIsInvalidValue confirms a parseable but invalid
+// value is still an invalid_query 400 (a truncated UTF-8 sequence decodes to
+// the replacement rune, which is not a published stage).
+func TestQueryMalformedUTF8ValueIsInvalidValue(t *testing.T) {
+	server, _ := newTestRouter(t)
+	registerIncident(t, server.URL, "INC-1", "medium", "alice")
+	rawQuery := "stage=%E5"
+	status, body := doRequest(t, http.MethodGet, server.URL+"/incidents?"+rawQuery, "")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", status)
+	}
+	assertInvalidQueryShape(t, rawQuery, body)
 }
