@@ -428,6 +428,224 @@ func TestCreateValidatesBeforeConflictCheck(t *testing.T) {
 	}
 }
 
+// replayBody builds a registration body for INC-1 without trimming or changing
+// the case of any value, so whitespace/case-sensitive conflicts are observable.
+func replayBody(t *testing.T, severity, owner string, assets []string) string {
+	t.Helper()
+	encoded, err := json.Marshal(assets)
+	if err != nil {
+		t.Fatalf("marshal assets: %v", err)
+	}
+	return fmt.Sprintf(`{"id":"INC-1","severity":%q,"assets":%s,"owner":%q}`, severity, string(encoded), owner)
+}
+
+func TestCreateReplayRecognizesCreationOwnerAfterTransition(t *testing.T) {
+	server, _ := newTestRouter(t)
+	if status, _ := doRequest(t, http.MethodPost, server.URL+"/incidents", validBody); status != http.StatusCreated {
+		t.Fatalf("create status = %d", status)
+	}
+	status, moved := transition(t, server.URL, "INC-1", `{"stage":"遏制","owner":"bob"}`)
+	if status != http.StatusOK {
+		t.Fatalf("transition status = %d (%v)", status, moved)
+	}
+	time.Sleep(time.Second) // a rewritten timestamp would be visible
+
+	// Resending the exact creation payload returns 201 with the CURRENT record:
+	// the owner stays bob, the stage stays 遏制, and the existing two-entry
+	// timeline (stage/owner/at and ordering) is returned untouched.
+	status, replayed := doRequest(t, http.MethodPost, server.URL+"/incidents", validBody)
+	if status != http.StatusCreated {
+		t.Fatalf("replay status = %d, want 201 (body %v)", status, replayed)
+	}
+	if replayed["stage"] != "遏制" || replayed["owner"] != "bob" {
+		t.Fatalf("replay regressed the incident: %v", replayed)
+	}
+	replayedTimeline := replayed["timeline"].([]any)
+	movedTimeline := moved["timeline"].([]any)
+	if len(replayedTimeline) != 2 {
+		t.Fatalf("replay timeline = %v, want the existing two entries", replayedTimeline)
+	}
+	for i := range movedTimeline {
+		got := replayedTimeline[i].(map[string]any)
+		want := movedTimeline[i].(map[string]any)
+		if got["stage"] != want["stage"] || got["owner"] != want["owner"] || got["at"] != want["at"] {
+			t.Fatalf("replay rewrote timeline entry %d: %v vs %v", i, got, want)
+		}
+	}
+
+	// The creation owner changed to bob (the CURRENT assignee): conflict, even
+	// though bob is precisely the owner now responsible for the incident.
+	ownerCurrent := replayBody(t, "high", "bob", []string{"db-1", "web-2"})
+	status, body := doRequest(t, http.MethodPost, server.URL+"/incidents", ownerCurrent)
+	if status != http.StatusConflict {
+		t.Fatalf("current-owner replay status = %d, want 409", status)
+	}
+	if code := errorCode(t, body); code != "incident_conflict" {
+		t.Fatalf("code = %q, want incident_conflict", code)
+	}
+	if len(body) != 1 {
+		t.Fatalf("error response must hold only the top-level error object: %v", body)
+	}
+
+	// Every deviation from the first creation values gives the same conflict.
+	conflicts := map[string]string{
+		"severity changed":       replayBody(t, "low", "alice", []string{"db-1", "web-2"}),
+		"asset order changed":    replayBody(t, "high", "alice", []string{"web-2", "db-1"}),
+		"asset content changed":  replayBody(t, "high", "alice", []string{"db-1", "web-3"}),
+		"asset duplicate added":  replayBody(t, "high", "alice", []string{"db-1", "web-2", "web-2"}),
+		"owner case changed":     replayBody(t, "high", "Alice", []string{"db-1", "web-2"}),
+		"owner whitespace added": replayBody(t, "high", " alice ", []string{"db-1", "web-2"}),
+	}
+	for name, payload := range conflicts {
+		t.Run(name, func(t *testing.T) {
+			status, decoded := doRequest(t, http.MethodPost, server.URL+"/incidents", payload)
+			if status != http.StatusConflict {
+				t.Fatalf("status = %d, want 409 (body %v)", status, decoded)
+			}
+			if code := errorCode(t, decoded); code != "incident_conflict" {
+				t.Fatalf("code = %q, want incident_conflict", code)
+			}
+		})
+	}
+
+	// Replays and conflicts perform no writes: a follow-up query still shows
+	// the post-transition state with its original two timeline entries.
+	status, fetched := doRequest(t, http.MethodGet, server.URL+"/incidents?id=INC-1", "")
+	if status != http.StatusOK {
+		t.Fatalf("fetch status = %d", status)
+	}
+	if fetched["stage"] != "遏制" || fetched["owner"] != "bob" {
+		t.Fatalf("incident changed: %v", fetched)
+	}
+	fetchedTimeline := fetched["timeline"].([]any)
+	if len(fetchedTimeline) != 2 {
+		t.Fatalf("timeline length = %d, want 2", len(fetchedTimeline))
+	}
+	for i := range movedTimeline {
+		got := fetchedTimeline[i].(map[string]any)
+		want := movedTimeline[i].(map[string]any)
+		if got["stage"] != want["stage"] || got["owner"] != want["owner"] || got["at"] != want["at"] {
+			t.Fatalf("timeline entry %d changed: %v vs %v", i, got, want)
+		}
+	}
+
+	// The incident now sits in the 遏制 filter bucket and left 受理.
+	_, contained := listIncidents(t, server.URL+"/incidents?stage="+url.QueryEscape("遏制"))
+	if len(contained) != 1 || contained[0].(map[string]any)["id"] != "INC-1" {
+		t.Fatalf("遏制 filter = %v", contained)
+	}
+	_, accepted := listIncidents(t, server.URL+"/incidents?stage="+url.QueryEscape("受理"))
+	if len(accepted) != 0 {
+		t.Fatalf("受理 filter = %v, want empty", accepted)
+	}
+}
+
+func TestCreateReplayAfterMultipleTransitionsAndClose(t *testing.T) {
+	server, _ := newTestRouter(t)
+	if status, _ := doRequest(t, http.MethodPost, server.URL+"/incidents", validBody); status != http.StatusCreated {
+		t.Fatalf("create status = %d", status)
+	}
+
+	creationAssets := []string{"db-1", "web-2"}
+	stages := []string{"遏制", "清除", "恢复", "关闭"}
+	owners := []string{"bob", "carol", "dave", "erin"}
+	for i, stage := range stages {
+		status, moved := transition(t, server.URL, "INC-1",
+			`{"stage":"`+stage+`","owner":"`+owners[i]+`"}`)
+		if status != http.StatusOK {
+			t.Fatalf("transition to %s: status %d (%v)", stage, status, moved)
+		}
+
+		// The original creation payload is recognized at every stage.
+		status, replayed := doRequest(t, http.MethodPost, server.URL+"/incidents", validBody)
+		if status != http.StatusCreated {
+			t.Fatalf("replay at %s: status = %d, want 201 (%v)", stage, status, replayed)
+		}
+		if replayed["stage"] != stage || replayed["owner"] != owners[i] {
+			t.Fatalf("replay at %s returned %v/%v", stage, replayed["stage"], replayed["owner"])
+		}
+		if len(replayed["timeline"].([]any)) != i+2 {
+			t.Fatalf("replay at %s changed timeline length", stage)
+		}
+
+		// A payload whose owner is merely the current assignee conflicts.
+		currentOwner := replayBody(t, "high", owners[i], creationAssets)
+		status, body := doRequest(t, http.MethodPost, server.URL+"/incidents", currentOwner)
+		if status != http.StatusConflict || errorCode(t, body) != "incident_conflict" {
+			t.Fatalf("current-owner replay at %s: status %d body %v", stage, status, body)
+		}
+	}
+
+	// The closed record is intact after all the replay traffic.
+	status, fetched := doRequest(t, http.MethodGet, server.URL+"/incidents?id=INC-1", "")
+	if status != http.StatusOK {
+		t.Fatalf("fetch status = %d", status)
+	}
+	if fetched["stage"] != "关闭" || fetched["owner"] != "erin" || len(fetched["timeline"].([]any)) != 5 {
+		t.Fatalf("closed incident changed: %v", fetched)
+	}
+}
+
+func TestCreateReplaySurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "service.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	first := httptest.NewServer(NewRouter(st))
+	if status, _ := doRequest(t, http.MethodPost, first.URL+"/incidents", validBody); status != http.StatusCreated {
+		t.Fatalf("create status = %d", status)
+	}
+	status, moved := transition(t, first.URL, "INC-1", `{"stage":"遏制","owner":"bob"}`)
+	if status != http.StatusOK {
+		t.Fatalf("transition status = %d", status)
+	}
+	first.Close()
+	st.Close()
+
+	// A restarted service reads the existing database and recognizes the
+	// creation replay with no re-registration step.
+	reopened, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	second := httptest.NewServer(NewRouter(reopened))
+	defer second.Close()
+
+	status, replayed := doRequest(t, http.MethodPost, second.URL+"/incidents", validBody)
+	if status != http.StatusCreated {
+		t.Fatalf("replay after restart: status = %d (%v)", status, replayed)
+	}
+	if replayed["stage"] != "遏制" || replayed["owner"] != "bob" || len(replayed["timeline"].([]any)) != 2 {
+		t.Fatalf("replay after restart = %v", replayed)
+	}
+	movedTimeline := moved["timeline"].([]any)
+	for i := range movedTimeline {
+		got := replayed["timeline"].([]any)[i].(map[string]any)
+		want := movedTimeline[i].(map[string]any)
+		if got["stage"] != want["stage"] || got["owner"] != want["owner"] || got["at"] != want["at"] {
+			t.Fatalf("restart replay changed entry %d: %v vs %v", i, got, want)
+		}
+	}
+
+	// Matching only the current assignee still conflicts after restart.
+	currentOwner := replayBody(t, "high", "bob", []string{"db-1", "web-2"})
+	status, body := doRequest(t, http.MethodPost, second.URL+"/incidents", currentOwner)
+	if status != http.StatusConflict || errorCode(t, body) != "incident_conflict" {
+		t.Fatalf("current-owner replay after restart: status %d body %v", status, body)
+	}
+
+	// Follow-up query behaves normally and shows the unchanged record.
+	status, fetched := doRequest(t, http.MethodGet, second.URL+"/incidents?id=INC-1", "")
+	if status != http.StatusOK || fetched["stage"] != "遏制" || fetched["owner"] != "bob" {
+		t.Fatalf("fetch after restart: status %d body %v", status, fetched)
+	}
+	if len(fetched["timeline"].([]any)) != 2 {
+		t.Fatalf("timeline after restart = %v", fetched["timeline"])
+	}
+}
+
 func registerIncident(t *testing.T, baseURL, id, severity, owner string) {
 	t.Helper()
 	body := `{"id":"` + id + `","severity":"` + severity + `","assets":["a"],"owner":"` + owner + `"}`

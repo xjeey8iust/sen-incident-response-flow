@@ -142,6 +142,140 @@ func TestRegisterConflict(t *testing.T) {
 	}
 }
 
+func TestRegisterReplayMatchesCreationOwnerAfterTransition(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+
+	if _, err := st.Register("INC-1", "high", "alice", []string{"db-1", "web-2"}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	moved, err := st.Transition("INC-1", "遏制", "bob")
+	if err != nil {
+		t.Fatalf("transition: %v", err)
+	}
+	time.Sleep(time.Second) // a rewritten timestamp would be visible
+
+	// The exact creation payload replays as the stored, already-transitioned
+	// record: 201-equivalent success, current owner bob, both timeline entries
+	// with their original stage/owner/at and ordering, no rollback to 受理.
+	replay, err := st.Register("INC-1", "high", "alice", []string{"db-1", "web-2"})
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if !reflect.DeepEqual(replay, moved) {
+		t.Fatalf("replay = %+v, want current record %+v", replay, moved)
+	}
+	if replay.Stage != "遏制" || replay.Owner != "bob" || len(replay.Timeline) != 2 {
+		t.Fatalf("replay regressed the incident: %+v", replay)
+	}
+
+	// Any deviation from the CREATION values conflicts — owner matching the
+	// current assignee does not rescue the request.
+	cases := []struct {
+		name     string
+		severity string
+		owner    string
+		assets   []string
+	}{
+		{"owner equals current but not creation", "high", "bob", []string{"db-1", "web-2"}},
+		{"severity differs", "low", "alice", []string{"db-1", "web-2"}},
+		{"asset order differs", "high", "alice", []string{"web-2", "db-1"}},
+		{"asset content differs", "high", "alice", []string{"db-1", "web-3"}},
+		{"asset duplicates count", "high", "alice", []string{"db-1", "web-2", "web-2"}},
+		{"owner casing differs", "high", "Alice", []string{"db-1", "web-2"}},
+		{"owner whitespace differs", "high", " alice", []string{"db-1", "web-2"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := st.Register("INC-1", tc.severity, tc.owner, tc.assets); !errors.Is(err, ErrIncidentConflict) {
+				t.Fatalf("err = %v, want ErrIncidentConflict", err)
+			}
+		})
+	}
+
+	// Neither the successful replay nor the conflicts wrote anything.
+	got, err := st.Get("INC-1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !reflect.DeepEqual(got, moved) {
+		t.Fatalf("history changed: %+v, want %+v", got, moved)
+	}
+}
+
+func TestRegisterReplayAfterEveryTransitionAndClose(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+
+	if _, err := st.Register("INC-1", "critical", "alice", []string{"a", "a", "b"}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	// Replaying the exact creation body (repeated assets included) is accepted
+	// at every stage along the flow, including after the incident is closed.
+	for i, stage := range []string{"遏制", "清除", "恢复", "关闭"} {
+		owner := []string{"bob", "carol", "dave", "erin"}[i]
+		moved, err := st.Transition("INC-1", stage, owner)
+		if err != nil {
+			t.Fatalf("transition to %s: %v", stage, err)
+		}
+		replay, err := st.Register("INC-1", "critical", "alice", []string{"a", "a", "b"})
+		if err != nil {
+			t.Fatalf("replay at %s: %v", stage, err)
+		}
+		if !reflect.DeepEqual(replay, moved) {
+			t.Fatalf("replay at %s = %+v, want %+v", stage, replay, moved)
+		}
+		// Owner equal to the current assignee but not the creation owner is
+		// still a conflict at every stage.
+		if _, err := st.Register("INC-1", "critical", owner, []string{"a", "a", "b"}); !errors.Is(err, ErrIncidentConflict) {
+			t.Fatalf("current-owner replay at %s: err = %v, want ErrIncidentConflict", stage, err)
+		}
+	}
+}
+
+func TestRegisterReplaySurvivesReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.db")
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := st.Register("INC-1", "high", "alice", []string{"db-1", "web-2"}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	moved, err := st.Transition("INC-1", "遏制", "bob")
+	if err != nil {
+		t.Fatalf("transition: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Records written by an already-running deployment need no re-registration:
+	// a restarted service recognizes the creation replay straight from disk.
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+
+	replay, err := reopened.Register("INC-1", "high", "alice", []string{"db-1", "web-2"})
+	if err != nil {
+		t.Fatalf("replay after reopen: %v", err)
+	}
+	if !reflect.DeepEqual(replay, moved) {
+		t.Fatalf("replay = %+v, want %+v", replay, moved)
+	}
+	if _, err := reopened.Register("INC-1", "high", "bob", []string{"db-1", "web-2"}); !errors.Is(err, ErrIncidentConflict) {
+		t.Fatalf("current-owner replay after reopen: err = %v, want ErrIncidentConflict", err)
+	}
+}
+
 func TestGetMissingIncident(t *testing.T) {
 	st, err := Open(filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {

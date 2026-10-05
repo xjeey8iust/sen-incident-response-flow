@@ -95,9 +95,13 @@ func (s *Store) Ping() error { return s.db.Ping() }
 func (s *Store) Close() error { return s.db.Close() }
 
 // Register stores a new incident and its initial timeline entry in one
-// transaction. Re-registering the same id with identical severity, assets
-// (order included), and owner returns the stored record unchanged; any
-// difference yields ErrIncidentConflict.
+// transaction. Re-registering the same id with severity, assets (order
+// included), and owner identical to the FIRST successful registration returns
+// the stored record unchanged — including its current stage, owner, and full
+// timeline after any number of transitions; the owner is compared against the
+// creation owner held in the first timeline entry, not the current owner. Any
+// difference in severity, assets, or the creation owner yields
+// ErrIncidentConflict.
 func (s *Store) Register(id, severity, owner string, assets []string) (Incident, error) {
 	existing, err := s.find(id)
 	if err != nil {
@@ -339,9 +343,19 @@ func queryTimeline(q interface {
 }
 
 // resolveDuplicate decides whether a repeated registration is the same
-// incident (returned unchanged) or a conflicting one.
+// incident (returned unchanged) or a conflicting one. The creation owner is
+// identified by the first timeline entry (the 受理 record written at the
+// first successful registration), never by the body's current owner: a
+// transition hands the incident to another owner without changing who
+// registered it. Severity and assets never change after creation, so they
+// are still compared against the body. Asset order and duplicates stay
+// significant through slices.Equal, and strings are compared verbatim.
 func resolveDuplicate(existing *Incident, severity, owner string, assets []string) (Incident, error) {
-	if existing.Severity == severity && existing.Owner == owner && slices.Equal(existing.Assets, assets) {
+	if len(existing.Timeline) == 0 {
+		return Incident{}, fmt.Errorf("incident %s has no initial timeline entry", existing.ID)
+	}
+	creationOwner := existing.Timeline[0].Owner
+	if existing.Severity == severity && creationOwner == owner && slices.Equal(existing.Assets, assets) {
 		return *existing, nil
 	}
 	return Incident{}, ErrIncidentConflict
