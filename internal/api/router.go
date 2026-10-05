@@ -61,20 +61,20 @@ type registerRequest struct {
 	Owner    *string   `json:"owner"`
 }
 
+// registerFields is the case-sensitive whitelist of accepted registration
+// fields. Names are compared after JSON unescaping, so "id" is accepted
+// while "ID" is an unknown field.
+var registerFields = map[string]bool{
+	"id":       true,
+	"severity": true,
+	"assets":   true,
+	"owner":    true,
+}
+
 func createIncident(st *store.Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		var payload registerRequest
-		decoder := json.NewDecoder(c.Request.Body)
-		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&payload); err != nil {
-			writeInvalidRequest(c)
-			return
-		}
-		if err := decoder.Decode(&struct{}{}); err != io.EOF {
-			writeInvalidRequest(c)
-			return
-		}
-		if !payload.valid() {
+		payload, ok := decodeRegisterRequest(c.Request.Body)
+		if !ok || !payload.valid() {
 			writeInvalidRequest(c)
 			return
 		}
@@ -90,6 +90,57 @@ func createIncident(st *store.Store) gin.HandlerFunc {
 		}
 		c.JSON(http.StatusCreated, incident)
 	}
+}
+
+// decodeRegisterRequest parses the registration body token by token so the
+// field whitelist stays case-sensitive and duplicate keys are rejected.
+// encoding/json's struct decoding cannot do either: it matches tags
+// case-insensitively and silently lets a later key overwrite an earlier one.
+// Keys arrive already unescaped, so "id" collides with "id" while
+// case variants like "ID" fall outside the whitelist.
+func decodeRegisterRequest(body io.Reader) (registerRequest, bool) {
+	var payload registerRequest
+	decoder := json.NewDecoder(body)
+	token, err := decoder.Token()
+	if err != nil {
+		return payload, false
+	}
+	if delim, ok := token.(json.Delim); !ok || delim != '{' {
+		return payload, false
+	}
+	seen := map[string]bool{}
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return payload, false
+		}
+		key, ok := token.(string)
+		if !ok || !registerFields[key] || seen[key] {
+			return payload, false
+		}
+		seen[key] = true
+		var decodeErr error
+		switch key {
+		case "id":
+			decodeErr = decoder.Decode(&payload.ID)
+		case "severity":
+			decodeErr = decoder.Decode(&payload.Severity)
+		case "assets":
+			decodeErr = decoder.Decode(&payload.Assets)
+		case "owner":
+			decodeErr = decoder.Decode(&payload.Owner)
+		}
+		if decodeErr != nil {
+			return payload, false
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return payload, false
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return payload, false
+	}
+	return payload, true
 }
 
 // valid reports whether every required field is present and well formed.
