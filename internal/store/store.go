@@ -16,6 +16,21 @@ import (
 // InitialStage is the stage every incident starts in when it is registered.
 const InitialStage = "受理"
 
+// stageOrder lists the stages in the only order an incident may advance.
+// Transitions move exactly one step forward along this list.
+var stageOrder = []string{"受理", "遏制", "清除", "恢复", "关闭"}
+
+// nextStage returns the stage that immediately follows current, or false when
+// current is the final stage (or otherwise has no successor).
+func nextStage(current string) (string, bool) {
+	for i, stage := range stageOrder[:len(stageOrder)-1] {
+		if stage == current {
+			return stageOrder[i+1], true
+		}
+	}
+	return "", false
+}
+
 // TimelineEntry records one stage of an incident's life together with the
 // owner responsible at that point and the UTC time the entry was created.
 type TimelineEntry struct {
@@ -41,6 +56,11 @@ var ErrIncidentConflict = errors.New("incident id already registered with differ
 // ErrIncidentNotFound is returned when no incident exists for an id.
 var ErrIncidentNotFound = errors.New("incident not found")
 
+// ErrInvalidTransition is returned when a transition does not advance the
+// incident exactly one stage forward: requesting the current stage, going
+// backward, skipping a stage, or moving on from the final stage.
+var ErrInvalidTransition = errors.New("transition does not advance exactly one stage")
+
 // Store wraps the SQLite handle so callers never touch database/sql directly.
 type Store struct {
 	db *sql.DB
@@ -52,6 +72,11 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
+	// SQLite admits a single writer, so funnel every call through one
+	// connection: transactions then serialize instead of failing with
+	// SQLITE_BUSY, and a transaction never waits on a pool connection its
+	// own goroutine is holding.
+	db.SetMaxOpenConns(1)
 	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("enable wal: %w", err)
@@ -92,7 +117,6 @@ func (s *Store) Register(id, severity, owner string, assets []string) (Incident,
 	if err != nil {
 		return Incident{}, fmt.Errorf("begin register: %w", err)
 	}
-	defer tx.Rollback()
 	if _, err = tx.Exec(
 		"INSERT INTO incidents (id, severity, assets, stage, owner) VALUES (?, ?, ?, ?, ?)",
 		id, severity, string(encoded), InitialStage, owner,
@@ -105,6 +129,9 @@ func (s *Store) Register(id, severity, owner string, assets []string) (Incident,
 		}
 	}
 	if err != nil {
+		// Roll back before re-reading: the store runs on a single
+		// connection, which the open transaction is still holding.
+		tx.Rollback()
 		// A concurrent register of the same id may have won the race.
 		if existing, findErr := s.find(id); findErr == nil && existing != nil {
 			return resolveDuplicate(existing, severity, owner, assets)
@@ -120,6 +147,72 @@ func (s *Store) Register(id, severity, owner string, assets []string) (Incident,
 		Owner:    owner,
 		Timeline: []TimelineEntry{{Stage: InitialStage, Owner: owner, At: at}},
 	}, nil
+}
+
+// Transition advances the incident registered under id to stage, which must
+// be the immediate successor of the current stage, and appends a timeline
+// entry with owner and a service-generated UTC timestamp. The stage, owner,
+// and history entry commit in one transaction: either all are stored or none
+// is. A concurrent transition of the same incident loses the race and
+// returns ErrInvalidTransition; a missing id returns ErrIncidentNotFound.
+func (s *Store) Transition(id, stage, owner string) (Incident, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return Incident{}, fmt.Errorf("begin transition: %w", err)
+	}
+	defer tx.Rollback()
+
+	incident, err := scanIncident(tx.QueryRow(
+		"SELECT id, severity, assets, stage, owner FROM incidents WHERE id = ?", id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Incident{}, ErrIncidentNotFound
+	}
+	if err != nil {
+		return Incident{}, fmt.Errorf("load incident: %w", err)
+	}
+
+	next, ok := nextStage(incident.Stage)
+	if !ok || next != stage {
+		return Incident{}, ErrInvalidTransition
+	}
+
+	at := time.Now().UTC().Format(time.RFC3339)
+	result, err := tx.Exec(
+		"UPDATE incidents SET stage = ?, owner = ? WHERE id = ? AND stage = ?",
+		stage, owner, id, incident.Stage)
+	if err != nil {
+		return Incident{}, fmt.Errorf("update stage: %w", err)
+	}
+	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+		// Another transition moved the incident between our read and write.
+		return Incident{}, ErrInvalidTransition
+	}
+
+	var seq int
+	if err := tx.QueryRow(
+		"SELECT COALESCE(MAX(seq), -1) + 1 FROM incident_timeline WHERE incident_id = ?", id,
+	).Scan(&seq); err != nil {
+		return Incident{}, fmt.Errorf("read timeline seq: %w", err)
+	}
+	if _, err := tx.Exec(
+		"INSERT INTO incident_timeline (incident_id, seq, stage, owner, at) VALUES (?, ?, ?, ?, ?)",
+		id, seq, stage, owner, at,
+	); err != nil {
+		return Incident{}, fmt.Errorf("append timeline: %w", err)
+	}
+
+	timeline, err := queryTimeline(tx, id)
+	if err != nil {
+		return Incident{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Incident{}, fmt.Errorf("commit transition: %w", err)
+	}
+
+	incident.Stage = stage
+	incident.Owner = owner
+	incident.Timeline = timeline
+	return incident, nil
 }
 
 // Get returns the incident registered under id, or ErrIncidentNotFound.
@@ -203,7 +296,15 @@ func (s *Store) find(id string) (*Incident, error) {
 
 // timeline loads the transition history of one incident in entry order.
 func (s *Store) timeline(id string) ([]TimelineEntry, error) {
-	rows, err := s.db.Query(
+	return queryTimeline(s.db, id)
+}
+
+// queryTimeline is timeline against any handle, so a transaction can read
+// history through its own connection instead of waiting on the pool.
+func queryTimeline(q interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+}, id string) ([]TimelineEntry, error) {
+	rows, err := q.Query(
 		"SELECT stage, owner, at FROM incident_timeline WHERE incident_id = ? ORDER BY seq", id)
 	if err != nil {
 		return nil, fmt.Errorf("read timeline: %w", err)
