@@ -337,6 +337,124 @@ func TestQueryRejectsInvalidParameters(t *testing.T) {
 	}
 }
 
+func TestQueryRejectsMalformedQueryString(t *testing.T) {
+	server, _ := newTestRouter(t)
+	registerIncident(t, server.URL, "INC-1", "medium", "alice")
+
+	cases := []string{
+		"?severity=%ZZ",                 // broken escape in value
+		"?%ZZ=high",                     // broken escape in name
+		"?severity=%2",                  // truncated escape
+		"?severity=%",                   // lone percent
+		"?id=INC-1&stage=%ZZ",           // valid id must not rescue a bad segment
+		"?stage=%ZZ&id=INC-1",           // segment order is irrelevant
+		"?severity=medium&stage=%ZZ",    // valid filter plus bad segment
+		"?foo=%ZZ",                      // bad escape on an unknown parameter
+		"?severity=%ZZ&severity=medium", // bad escape on a repeated parameter
+		"?id=INC-1;severity=medium",     // unescaped semicolon between segments
+		"?severity=medium;",             // trailing semicolon
+	}
+	for _, query := range cases {
+		t.Run(query, func(t *testing.T) {
+			status, body := doRequest(t, http.MethodGet, server.URL+"/incidents"+query, "")
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body %v)", status, body)
+			}
+			if len(body) != 1 {
+				t.Fatalf("error response must hold only the top-level error object: %v", body)
+			}
+			if code := errorCode(t, body); code != "invalid_query" {
+				t.Fatalf("code = %q, want invalid_query", code)
+			}
+		})
+	}
+
+	// The rejected requests must not have touched the stored incident.
+	status, body := doRequest(t, http.MethodGet, server.URL+"/incidents?id=INC-1", "")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	timeline := body["timeline"].([]any)
+	if len(timeline) != 1 || body["stage"] != "受理" {
+		t.Fatalf("rejected queries changed the incident: %v", body)
+	}
+}
+
+func TestQueryDecodesNamesOnce(t *testing.T) {
+	server, _ := newTestRouter(t)
+	registerIncident(t, server.URL, "INC-1", "high", "alice")
+
+	// %73everity decodes to severity and is recognized as the filter name.
+	status, items := listIncidents(t, server.URL+"/incidents?%73everity=high")
+	if status != http.StatusOK || len(items) != 1 {
+		t.Fatalf("encoded name: status %d items %v", status, items)
+	}
+
+	// The decoded name collapses with the literal one into a repetition.
+	status, body := doRequest(t, http.MethodGet, server.URL+"/incidents?%73everity=high&severity=high", "")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", status)
+	}
+	if code := errorCode(t, body); code != "invalid_query" {
+		t.Fatalf("code = %q, want invalid_query", code)
+	}
+}
+
+func TestGetIncidentWithEncodedSpecialCharacters(t *testing.T) {
+	server, _ := newTestRouter(t)
+	registerIncident(t, server.URL, "INC-1;A&B+C", "low", "alice")
+	registerIncident(t, server.URL, "INC 7", "low", "bob")
+
+	// %3B, %26 and %2B match a literal semicolon, ampersand and plus in the
+	// id instead of splitting the query into more parameters.
+	status, body := doRequest(t, http.MethodGet, server.URL+"/incidents?id=INC-1%3BA%26B%2BC", "")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %v)", status, body)
+	}
+	if body["id"] != "INC-1;A&B+C" {
+		t.Fatalf("id = %v", body["id"])
+	}
+
+	// A plain + still decodes to a space.
+	status, body = doRequest(t, http.MethodGet, server.URL+"/incidents?id=INC+7", "")
+	if status != http.StatusOK || body["id"] != "INC 7" {
+		t.Fatalf("plus-as-space: status %d body %v", status, body)
+	}
+
+	// %2B is a literal plus and must not match the space-containing id.
+	status, body = doRequest(t, http.MethodGet, server.URL+"/incidents?id=INC%2B7", "")
+	if status != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", status)
+	}
+	if code := errorCode(t, body); code != "incident_not_found" {
+		t.Fatalf("code = %q, want incident_not_found", code)
+	}
+}
+
+func TestQueryValidationPrecedesStorage(t *testing.T) {
+	server, st := newTestRouter(t)
+	registerIncident(t, server.URL, "INC-1", "medium", "alice")
+	st.Close()
+
+	// Malformed queries are rejected even while the store is down.
+	status, body := doRequest(t, http.MethodGet, server.URL+"/incidents?severity=%ZZ", "")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", status)
+	}
+	if code := errorCode(t, body); code != "invalid_query" {
+		t.Fatalf("code = %q, want invalid_query", code)
+	}
+
+	// Well-formed queries still surface the storage failure.
+	status, body = doRequest(t, http.MethodGet, server.URL+"/incidents?severity=medium", "")
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", status)
+	}
+	if code := errorCode(t, body); code != "storage_unavailable" {
+		t.Fatalf("code = %q, want storage_unavailable", code)
+	}
+}
+
 func TestIncidentsPersistAcrossRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "service.db")
 	st, err := store.Open(path)
