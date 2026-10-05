@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -63,18 +64,8 @@ type registerRequest struct {
 
 func createIncident(st *store.Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		var payload registerRequest
-		decoder := json.NewDecoder(c.Request.Body)
-		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&payload); err != nil {
-			writeInvalidRequest(c)
-			return
-		}
-		if err := decoder.Decode(&struct{}{}); err != io.EOF {
-			writeInvalidRequest(c)
-			return
-		}
-		if !payload.valid() {
+		payload, err := decodeRegisterRequest(c.Request.Body)
+		if err != nil || !payload.valid() {
 			writeInvalidRequest(c)
 			return
 		}
@@ -89,6 +80,69 @@ func createIncident(st *store.Store) gin.HandlerFunc {
 			return
 		}
 		c.JSON(http.StatusCreated, incident)
+	}
+}
+
+// decodeRegisterRequest parses the registration body token by token so the
+// field whitelist is applied to the decoded names exactly as JSON defines
+// them: case-sensitive, with escapes like \u0069 already resolved. Unknown
+// fields and any repeated name — same value or not — reject the whole body
+// before the store is touched, as do trailing values after the object.
+func decodeRegisterRequest(reader io.Reader) (registerRequest, error) {
+	var payload registerRequest
+	decoder := json.NewDecoder(reader)
+	token, err := decoder.Token()
+	if err != nil {
+		return payload, err
+	}
+	if delim, ok := token.(json.Delim); !ok || delim != '{' {
+		return payload, errors.New("request body must be a JSON object")
+	}
+	seen := map[string]bool{}
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return payload, err
+		}
+		name, ok := token.(string)
+		if !ok {
+			return payload, errors.New("request body must be a JSON object")
+		}
+		if seen[name] {
+			return payload, fmt.Errorf("duplicate field %q", name)
+		}
+		seen[name] = true
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return payload, err
+		}
+		if err := payload.setField(name, value); err != nil {
+			return payload, err
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return payload, err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return payload, errors.New("request body must hold a single JSON object")
+	}
+	return payload, nil
+}
+
+// setField stores one raw value under its decoded name, rejecting names
+// outside the whitelist and values of the wrong JSON type.
+func (r *registerRequest) setField(name string, value json.RawMessage) error {
+	switch name {
+	case "id":
+		return json.Unmarshal(value, &r.ID)
+	case "severity":
+		return json.Unmarshal(value, &r.Severity)
+	case "assets":
+		return json.Unmarshal(value, &r.Assets)
+	case "owner":
+		return json.Unmarshal(value, &r.Owner)
+	default:
+		return fmt.Errorf("unknown field %q", name)
 	}
 }
 

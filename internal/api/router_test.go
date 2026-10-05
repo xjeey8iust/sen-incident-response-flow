@@ -224,6 +224,151 @@ func TestCreateValidatesBeforeConflictCheck(t *testing.T) {
 	}
 }
 
+func TestCreateAcceptsEscapedNamesAndFreeOrder(t *testing.T) {
+	server, _ := newTestRouter(t)
+
+	// \u0069 decodes to id; field order, insignificant whitespace and
+	// escaped name spellings are all legal. Repeated asset names are
+	// values, not duplicate fields, and are kept as sent.
+	body := "{\n  \"owner\": \"alice\",\n  \"assets\": [\"db-1\", \"db-1\"],\n  \"severity\": \"high\",\n  \"\\u0069d\": \"INC-esc\"\n}"
+	status, created := doRequest(t, http.MethodPost, server.URL+"/incidents", body)
+	if status != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body %v)", status, created)
+	}
+	if created["id"] != "INC-esc" || created["stage"] != "受理" {
+		t.Fatalf("created = %v", created)
+	}
+	assets := created["assets"].([]any)
+	if len(assets) != 2 || assets[0] != "db-1" || assets[1] != "db-1" {
+		t.Fatalf("assets = %v, want [db-1 db-1]", assets)
+	}
+}
+
+func TestCreateRejectsCaseVariantFieldNames(t *testing.T) {
+	server, _ := newTestRouter(t)
+	cases := map[string]string{
+		"ID":           `{"ID":"INC-1","severity":"high","assets":["a"],"owner":"x"}`,
+		"Id":           `{"Id":"INC-1","severity":"high","assets":["a"],"owner":"x"}`,
+		"Severity":     `{"id":"INC-1","Severity":"high","assets":["a"],"owner":"x"}`,
+		"SEVERITY":     `{"id":"INC-1","SEVERITY":"high","assets":["a"],"owner":"x"}`,
+		"Assets":       `{"id":"INC-1","severity":"high","Assets":["a"],"owner":"x"}`,
+		"ASSETS":       `{"id":"INC-1","severity":"high","ASSETS":["a"],"owner":"x"}`,
+		"Owner":        `{"id":"INC-1","severity":"high","assets":["a"],"Owner":"x"}`,
+		"OWNER":        `{"id":"INC-1","severity":"high","assets":["a"],"OWNER":"x"}`,
+		"ID beside id": `{"ID":"INC-9","id":"INC-1","severity":"high","assets":["a"],"owner":"x"}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			status, decoded := doRequest(t, http.MethodPost, server.URL+"/incidents", body)
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d (body %v)", status, http.StatusBadRequest, decoded)
+			}
+			if len(decoded) != 1 {
+				t.Fatalf("error response must hold only the top-level error object: %v", decoded)
+			}
+			if code := errorCode(t, decoded); code != "invalid_request" {
+				t.Fatalf("code = %q, want invalid_request", code)
+			}
+		})
+	}
+
+	// Nothing may have been written by the rejected requests.
+	_, items := listIncidents(t, server.URL+"/incidents")
+	if len(items) != 0 {
+		t.Fatalf("rejected requests wrote incidents: %v", items)
+	}
+}
+
+func TestCreateRejectsDuplicateFields(t *testing.T) {
+	server, _ := newTestRouter(t)
+	cases := map[string]string{
+		"id same value":            `{"id":"INC-1","id":"INC-1","severity":"high","assets":["a"],"owner":"x"}`,
+		"id different value":       `{"id":"INC-1","id":"INC-2","severity":"high","assets":["a"],"owner":"x"}`,
+		"id null then valid":       `{"id":null,"id":"INC-1","severity":"high","assets":["a"],"owner":"x"}`,
+		"id valid then null":       `{"id":"INC-1","id":null,"severity":"high","assets":["a"],"owner":"x"}`,
+		"id escaped twin":          `{"id":"INC-1","\u0069d":"INC-1","severity":"high","assets":["a"],"owner":"x"}`,
+		"severity same value":      `{"id":"INC-1","severity":"high","severity":"high","assets":["a"],"owner":"x"}`,
+		"severity invalid then ok": `{"id":"INC-1","severity":"urgent","severity":"high","assets":["a"],"owner":"x"}`,
+		"assets same value":        `{"id":"INC-1","severity":"high","assets":["a"],"assets":["a"],"owner":"x"}`,
+		"assets null then valid":   `{"id":"INC-1","severity":"high","assets":null,"assets":["a"],"owner":"x"}`,
+		"owner same value":         `{"id":"INC-1","severity":"high","assets":["a"],"owner":"x","owner":"x"}`,
+		"owner null then valid":    `{"id":"INC-1","severity":"high","assets":["a"],"owner":null,"owner":"x"}`,
+		"owner wrong type then ok": `{"id":"INC-1","severity":"high","assets":["a"],"owner":7,"owner":"x"}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			status, decoded := doRequest(t, http.MethodPost, server.URL+"/incidents", body)
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d (body %v)", status, http.StatusBadRequest, decoded)
+			}
+			if len(decoded) != 1 {
+				t.Fatalf("error response must hold only the top-level error object: %v", decoded)
+			}
+			if code := errorCode(t, decoded); code != "invalid_request" {
+				t.Fatalf("code = %q, want invalid_request", code)
+			}
+		})
+	}
+
+	// Nothing may have been written by the rejected requests.
+	_, items := listIncidents(t, server.URL+"/incidents")
+	if len(items) != 0 {
+		t.Fatalf("rejected requests wrote incidents: %v", items)
+	}
+}
+
+func TestCreateRejectsInvalidBeforeIdCheckAndStorage(t *testing.T) {
+	server, st := newTestRouter(t)
+	registerIncident(t, server.URL, "INC-1", "medium", "alice")
+
+	invalid := []string{
+		`{"ID":"INC-1","severity":"medium","assets":["a"],"owner":"alice"}`,
+		`{"id":"INC-1","id":"INC-1","severity":"medium","assets":["a"],"owner":"alice"}`,
+		`{"id":"INC-1","severity":"medium","assets":["a"],"owner":"alice","owner":"alice"}`,
+	}
+	assertInvalid := func(body string) {
+		t.Helper()
+		status, decoded := doRequest(t, http.MethodPost, server.URL+"/incidents", body)
+		if status != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (body %v)", status, decoded)
+		}
+		if code := errorCode(t, decoded); code != "invalid_request" {
+			t.Fatalf("code = %q, want invalid_request", code)
+		}
+	}
+
+	// The id already exists: validation still wins over the id check.
+	for _, body := range invalid {
+		assertInvalid(body)
+	}
+
+	// The stored incident kept its attributes and its single timeline entry.
+	status, fetched := doRequest(t, http.MethodGet, server.URL+"/incidents?id=INC-1", "")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	timeline := fetched["timeline"].([]any)
+	if fetched["severity"] != "medium" || fetched["owner"] != "alice" ||
+		fetched["stage"] != "受理" || len(timeline) != 1 {
+		t.Fatalf("rejected requests changed the incident: %v", fetched)
+	}
+
+	// The same rejections hold while the store is down, and a valid body
+	// still surfaces the storage failure instead of a validation error.
+	st.Close()
+	for _, body := range invalid {
+		assertInvalid(body)
+	}
+	status, decoded := doRequest(t, http.MethodPost, server.URL+"/incidents",
+		`{"id":"INC-2","severity":"low","assets":["a"],"owner":"bob"}`)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (body %v)", status, decoded)
+	}
+	if code := errorCode(t, decoded); code != "storage_unavailable" {
+		t.Fatalf("code = %q, want storage_unavailable", code)
+	}
+}
+
 func registerIncident(t *testing.T, baseURL, id, severity, owner string) {
 	t.Helper()
 	body := `{"id":"` + id + `","severity":"` + severity + `","assets":["a"],"owner":"` + owner + `"}`
